@@ -185,7 +185,6 @@ async function configure() {
 
   // Public repo over a plain git URL: no GitHub App install, no deploy key.
   const src = await tryRoutes([
-    ['POST', 'application.saveGitProdiver', { applicationId, customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/', customGitSSHKeyId: null, enableSubmodules: false, watchPaths: [] }],
     ['POST', 'application.saveGitProvider', { applicationId, customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/', customGitSSHKeyId: null, enableSubmodules: false, watchPaths: [] }],
     ['POST', 'application.update', { applicationId, sourceType: 'git', customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/' }],
   ]);
@@ -194,8 +193,8 @@ async function configure() {
 
   // The repo ships a Dockerfile; nixpacks (the default) would ignore it.
   const build = await tryRoutes([
-    ['POST', 'application.saveBuildType', { applicationId, buildType: 'dockerfile', dockerfile: 'Dockerfile', dockerContextPath: '', dockerBuildStage: '', isStaticSpa: false }],
     ['POST', 'application.update', { applicationId, buildType: 'dockerfile', dockerfile: 'Dockerfile' }],
+    ['POST', 'application.saveBuildType', { applicationId, buildType: 'dockerfile', dockerfile: 'Dockerfile', dockerContextPath: '', dockerBuildStage: '', isStaticSpa: false }],
   ]);
   if (!build.ok) throw new Error(`could not set build type: ${JSON.stringify(build.attempts)}`);
   console.log(`build set   dockerfile ./Dockerfile  (via ${build.route})`);
