@@ -1,0 +1,22 @@
+{
+  "name": "social-media-notifications",
+  "version": "1.0.0",
+  "description": "Instant Slack notifications for new YouTube and Facebook content (videos, Shorts/Reels, posts, live streams).",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:local": "node --env-file=.env src/index.js",
+    "dev": "node --env-file=.env --watch src/index.js",
+    "selftest": "node --env-file=.env scripts/selftest.mjs",
+    "dokploy": "node scripts/dokploy.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "fast-xml-parser": "^4.5.1"
+  },
+  "license": "MIT"
+}

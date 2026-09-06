@@ -1,0 +1,16 @@
+# Local / plain-Docker runs. On Dokploy you deploy the Dockerfile directly and
+# set env vars + the volume in the app UI (or via scripts/dokploy.mjs).
+services:
+  notifier:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    ports:
+      - "3000:3000"
+    volumes:
+      - notifier-data:/data
+
+volumes:
+  notifier-data:

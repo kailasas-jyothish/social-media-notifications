@@ -1,0 +1,198 @@
+#!/usr/bin/env node
+/**
+ * Dokploy control script.
+ *
+ *   node scripts/dokploy.mjs probe          # discover the API surface + auth
+ *   node scripts/dokploy.mjs find           # locate the app by name
+ *   node scripts/dokploy.mjs show           # dump the app's current config
+ *   node scripts/dokploy.mjs push-env       # upload .env to the app
+ *   node scripts/dokploy.mjs deploy         # trigger a deploy
+ *   node scripts/dokploy.mjs setup          # push-env then deploy
+ *
+ * Reads DOKPLOY_URL, DOKPLOY_API_KEY, DOKPLOY_APP_NAME from .env.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const envPath = path.join(root, '.env');
+
+function readEnvFile(file) {
+  if (!fs.existsSync(file)) return {};
+  const out = {};
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+const fileEnv = readEnvFile(envPath);
+const env = { ...fileEnv, ...process.env };
+
+const BASE = (env.DOKPLOY_URL || '').replace(/\/+$/, '');
+const KEY = env.DOKPLOY_API_KEY || '';
+const APP_NAME = env.DOKPLOY_APP_NAME || 'Social-media-notifications';
+
+// Runtime env vars the app actually needs (everything except the Dokploy ones).
+const RUNTIME_KEYS = Object.keys(fileEnv).filter((k) => !k.startsWith('DOKPLOY_'));
+
+if (!BASE || !KEY) {
+  console.error('Set DOKPLOY_URL and DOKPLOY_API_KEY in .env first.');
+  process.exit(1);
+}
+
+const headers = {
+  'x-api-key': KEY,
+  authorization: `Bearer ${KEY}`,
+  'content-type': 'application/json',
+  accept: 'application/json',
+};
+
+async function call(method, route, payload) {
+  const url = `${BASE}/api/${route.replace(/^\/+/, '')}`;
+  const init = { method, headers };
+  let target = url;
+  if (method === 'GET' && payload && Object.keys(payload).length) {
+    target += `?${new URLSearchParams(payload)}`;
+  } else if (payload) {
+    init.body = JSON.stringify(payload);
+  }
+  const res = await fetch(target, init);
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { ok: res.ok, status: res.status, body, url: target };
+}
+
+const GET = (route, params) => call('GET', route, params);
+const POST = (route, payload) => call('POST', route, payload);
+
+/** Try several candidate routes and return the first that succeeds. */
+async function tryRoutes(candidates) {
+  const attempts = [];
+  for (const [method, route, payload] of candidates) {
+    const r = await call(method, route, payload);
+    attempts.push({ method, route, status: r.status });
+    if (r.ok) return { ...r, route, method, attempts };
+  }
+  return { ok: false, attempts };
+}
+
+// ---------------------------------------------------------------- commands
+
+async function probe() {
+  console.log(`Dokploy base: ${BASE}`);
+  for (const doc of ['/swagger', '/swagger/json', '/api/openapi.json', '/openapi.json']) {
+    const res = await fetch(`${BASE}${doc}`, { headers }).catch(() => null);
+    if (res?.ok) {
+      const ct = res.headers.get('content-type') || '';
+      console.log(`  docs: ${BASE}${doc}  (${res.status}, ${ct})`);
+      if (ct.includes('json')) {
+        const spec = await res.json().catch(() => null);
+        const paths = spec?.paths ? Object.keys(spec.paths) : [];
+        const interesting = paths.filter((p) => /application|project|domain|deploy|env/i.test(p));
+        console.log(`  ${paths.length} paths in spec; relevant ones:`);
+        for (const p of interesting.slice(0, 80)) {
+          console.log(`    ${Object.keys(spec.paths[p]).join(',').toUpperCase().padEnd(12)} ${p}`);
+        }
+        fs.writeFileSync(path.join(root, 'dokploy-openapi.json'), JSON.stringify(spec, null, 2));
+        console.log('  full spec written to dokploy-openapi.json');
+        return;
+      }
+    }
+  }
+  console.log('  no OpenAPI doc found; probing known routes');
+  const r = await tryRoutes([
+    ['GET', 'project.all'],
+    ['GET', 'projects.all'],
+    ['GET', 'settings.health'],
+    ['GET', 'auth.get'],
+    ['GET', 'user.get'],
+  ]);
+  console.log(JSON.stringify(r.attempts, null, 2));
+  if (r.ok) console.log(`auth works via ${r.method} ${r.route}`);
+  else console.log('none of the probe routes answered 2xx — share the output and I will adjust.');
+}
+
+async function listProjects() {
+  const r = await tryRoutes([
+    ['GET', 'project.all'],
+    ['GET', 'projects.all'],
+  ]);
+  if (!r.ok) throw new Error(`cannot list projects: ${JSON.stringify(r.attempts)}`);
+  return Array.isArray(r.body) ? r.body : r.body?.data || [];
+}
+
+async function findApp() {
+  const projects = await listProjects();
+  for (const project of projects) {
+    const apps = project.applications || project.services?.applications || [];
+    for (const app of apps) {
+      const name = app.name || app.appName;
+      if (String(name).toLowerCase() === APP_NAME.toLowerCase()) {
+        return { app, project };
+      }
+    }
+  }
+  const names = projects.flatMap((p) => (p.applications || []).map((a) => a.name));
+  throw new Error(`application "${APP_NAME}" not found. Applications visible: ${names.join(', ') || '(none)'}`);
+}
+
+async function show() {
+  const { app, project } = await findApp();
+  console.log(`project: ${project.name} (${project.projectId})`);
+  console.log(`app:     ${app.name} (${app.applicationId})`);
+  console.log(`source:  ${app.sourceType} ${app.repository || app.customGitUrl || ''} @ ${app.branch || ''}`);
+  console.log(`build:   ${app.buildType} ${app.dockerfile || ''}`);
+  console.log(`domains: ${(app.domains || []).map((d) => `${d.https ? 'https' : 'http'}://${d.host}:${d.port}`).join(', ') || '(none)'}`);
+  console.log(`status:  ${app.applicationStatus}`);
+  return { app, project };
+}
+
+function envBlock() {
+  return RUNTIME_KEYS.map((k) => `${k}=${fileEnv[k] ?? ''}`).join('\n');
+}
+
+async function pushEnv() {
+  const { app } = await findApp();
+  const applicationId = app.applicationId;
+  const r = await tryRoutes([
+    ['POST', 'application.saveEnvironment', { applicationId, env: envBlock() }],
+    ['POST', 'application.update', { applicationId, env: envBlock() }],
+  ]);
+  if (!r.ok) throw new Error(`could not save env: ${JSON.stringify(r.attempts)}`);
+  console.log(`env pushed (${RUNTIME_KEYS.length} vars) via ${r.route}`);
+}
+
+async function deploy() {
+  const { app } = await findApp();
+  const applicationId = app.applicationId;
+  const r = await tryRoutes([
+    ['POST', 'application.deploy', { applicationId }],
+    ['POST', 'application.redeploy', { applicationId }],
+  ]);
+  if (!r.ok) throw new Error(`could not deploy: ${JSON.stringify(r.attempts)}`);
+  console.log(`deploy triggered via ${r.route}`);
+}
+
+const commands = { probe, find: show, show, 'push-env': pushEnv, deploy, setup: async () => { await pushEnv(); await deploy(); } };
+
+const cmd = process.argv[2] || 'probe';
+const fn = commands[cmd];
+if (!fn) {
+  console.error(`unknown command "${cmd}". Available: ${Object.keys(commands).join(', ')}`);
+  process.exit(1);
+}
+fn().catch((err) => {
+  console.error(err.message);
+  process.exit(1);
+});
