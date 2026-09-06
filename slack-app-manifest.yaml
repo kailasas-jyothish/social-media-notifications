@@ -1,0 +1,26 @@
+# Slack app manifest for the notifier bot.
+#
+# Paste into api.slack.com/apps -> "Create New App" -> "From an app manifest",
+# or POST to apps.manifest.create with a configuration token.
+#
+# chat:write.public is deliberate: it lets the bot post to any public channel
+# without being invited first, which removes the usual "bot posted nothing and
+# reported no error" failure where the token is valid but not a channel member.
+display_information:
+  name: Social Media Notifier
+  description: Posts YouTube and Facebook posts, reels, videos and live streams to Slack the moment they go up.
+  background_color: "#1a1d21"
+features:
+  bot_user:
+    display_name: Social Media Notifier
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.public
+      - links:read
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
