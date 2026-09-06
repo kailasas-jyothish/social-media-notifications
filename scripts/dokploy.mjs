@@ -5,11 +5,13 @@
  *   node scripts/dokploy.mjs probe          # discover the API surface + auth
  *   node scripts/dokploy.mjs find           # locate the app by name
  *   node scripts/dokploy.mjs show           # dump the app's current config
+ *   node scripts/dokploy.mjs configure      # git source + Dockerfile build + domain + /data volume
  *   node scripts/dokploy.mjs push-env       # upload .env to the app
  *   node scripts/dokploy.mjs deploy         # trigger a deploy
- *   node scripts/dokploy.mjs setup          # push-env then deploy
+ *   node scripts/dokploy.mjs setup          # configure, push-env, then deploy
  *
- * Reads DOKPLOY_URL, DOKPLOY_API_KEY, DOKPLOY_APP_NAME from .env.
+ * Reads DOKPLOY_URL, DOKPLOY_API_KEY, DOKPLOY_APP_NAME, DOKPLOY_GIT_URL,
+ * DOKPLOY_GIT_BRANCH from .env.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -37,6 +39,8 @@ const env = { ...fileEnv, ...process.env };
 const BASE = (env.DOKPLOY_URL || '').replace(/\/+$/, '');
 const KEY = env.DOKPLOY_API_KEY || '';
 const APP_NAME = env.DOKPLOY_APP_NAME || 'Social-media-notifications';
+const GIT_URL = env.DOKPLOY_GIT_URL || '';
+const GIT_BRANCH = env.DOKPLOY_GIT_BRANCH || 'main';
 
 // Runtime env vars the app actually needs (everything except the Dokploy ones).
 const RUNTIME_KEYS = Object.keys(fileEnv).filter((k) => !k.startsWith('DOKPLOY_'));
@@ -132,30 +136,98 @@ async function listProjects() {
   return Array.isArray(r.body) ? r.body : r.body?.data || [];
 }
 
+/**
+ * Dokploy nests services one level deeper than the old docs suggest:
+ * project -> environments[] -> applications[]. project.all returns only a
+ * stub per application, so the id is re-fetched through application.one.
+ */
 async function findApp() {
   const projects = await listProjects();
+  const seen = [];
   for (const project of projects) {
-    const apps = project.applications || project.services?.applications || [];
-    for (const app of apps) {
-      const name = app.name || app.appName;
-      if (String(name).toLowerCase() === APP_NAME.toLowerCase()) {
-        return { app, project };
+    for (const environment of project.environments || []) {
+      for (const stub of environment.applications || []) {
+        const name = stub.name || stub.appName;
+        seen.push(name);
+        if (String(name).toLowerCase() === APP_NAME.toLowerCase()) {
+          const r = await GET('application.one', { applicationId: stub.applicationId });
+          if (!r.ok) throw new Error(`application.one failed: ${r.status} ${JSON.stringify(r.body)}`);
+          return { app: r.body, project, environment };
+        }
       }
     }
   }
-  const names = projects.flatMap((p) => (p.applications || []).map((a) => a.name));
-  throw new Error(`application "${APP_NAME}" not found. Applications visible: ${names.join(', ') || '(none)'}`);
+  throw new Error(`application "${APP_NAME}" not found. Applications visible: ${seen.join(', ') || '(none)'}`);
 }
 
 async function show() {
-  const { app, project } = await findApp();
-  console.log(`project: ${project.name} (${project.projectId})`);
+  const { app, project, environment } = await findApp();
+  const source =
+    app.sourceType === 'git'
+      ? `${app.customGitUrl || '(no url)'} @ ${app.customGitBranch || '(no branch)'}`
+      : `${app.repository || '(no repo)'} @ ${app.branch || '(no branch)'}`;
+  console.log(`project: ${project.name} / ${environment.name} (${app.environmentId})`);
   console.log(`app:     ${app.name} (${app.applicationId})`);
-  console.log(`source:  ${app.sourceType} ${app.repository || app.customGitUrl || ''} @ ${app.branch || ''}`);
+  console.log(`source:  ${app.sourceType} ${source}`);
   console.log(`build:   ${app.buildType} ${app.dockerfile || ''}`);
-  console.log(`domains: ${(app.domains || []).map((d) => `${d.https ? 'https' : 'http'}://${d.host}:${d.port}`).join(', ') || '(none)'}`);
+  console.log(`domains: ${(app.domains || []).map((d) => `${d.https ? 'https' : 'http'}://${d.host} -> :${d.port}`).join(', ') || '(none)'}`);
+  console.log(`mounts:  ${(app.mounts || []).map((m) => `${m.volumeName || m.type}:${m.mountPath}`).join(', ') || '(none)'}`);
+  console.log(`env:     ${app.env ? `${app.env.split('\n').filter(Boolean).length} vars` : '(none)'}`);
   console.log(`status:  ${app.applicationStatus}`);
-  return { app, project };
+  console.log(`webhook: ${BASE}/api/deploy/${app.refreshToken}`);
+  return { app, project, environment };
+}
+
+async function configure() {
+  if (!GIT_URL) throw new Error('set DOKPLOY_GIT_URL in .env (e.g. https://github.com/you/social-media-notifications.git)');
+  const { app } = await findApp();
+  const applicationId = app.applicationId;
+
+  // Public repo over a plain git URL: no GitHub App install, no deploy key.
+  const src = await tryRoutes([
+    ['POST', 'application.saveGitProdiver', { applicationId, customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/', customGitSSHKeyId: null, enableSubmodules: false, watchPaths: [] }],
+    ['POST', 'application.saveGitProvider', { applicationId, customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/', customGitSSHKeyId: null, enableSubmodules: false, watchPaths: [] }],
+    ['POST', 'application.update', { applicationId, sourceType: 'git', customGitUrl: GIT_URL, customGitBranch: GIT_BRANCH, customGitBuildPath: '/' }],
+  ]);
+  if (!src.ok) throw new Error(`could not set git source: ${JSON.stringify(src.attempts)}`);
+  console.log(`source set  ${GIT_URL} @ ${GIT_BRANCH}  (via ${src.route})`);
+
+  // The repo ships a Dockerfile; nixpacks (the default) would ignore it.
+  const build = await tryRoutes([
+    ['POST', 'application.saveBuildType', { applicationId, buildType: 'dockerfile', dockerfile: 'Dockerfile', dockerContextPath: '', dockerBuildStage: '', isStaticSpa: false }],
+    ['POST', 'application.update', { applicationId, buildType: 'dockerfile', dockerfile: 'Dockerfile' }],
+  ]);
+  if (!build.ok) throw new Error(`could not set build type: ${JSON.stringify(build.attempts)}`);
+  console.log(`build set   dockerfile ./Dockerfile  (via ${build.route})`);
+
+  // Dedupe state lives in DATA_DIR and must survive redeploys.
+  const mountPath = fileEnv.DATA_DIR || '/data';
+  if ((app.mounts || []).some((m) => m.mountPath === mountPath)) {
+    console.log(`mount ok    ${mountPath} already mounted`);
+  } else {
+    const mount = await tryRoutes([
+      ['POST', 'mounts.create', { type: 'volume', volumeName: 'social-notify-data', mountPath, serviceId: applicationId, serviceType: 'application' }],
+      ['POST', 'mount.create', { type: 'volume', volumeName: 'social-notify-data', mountPath, serviceId: applicationId, serviceType: 'application' }],
+    ]);
+    if (!mount.ok) throw new Error(`could not create volume mount: ${JSON.stringify(mount.attempts)}`);
+    console.log(`mount set   volume social-notify-data -> ${mountPath}  (via ${mount.route})`);
+  }
+
+  // WebSub will not deliver without a public HTTPS callback, so the domain is
+  // part of configuration rather than a nicety.
+  const host = (fileEnv.PUBLIC_URL || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  if (!host) {
+    console.log('domain      skipped (PUBLIC_URL is empty)');
+  } else if ((app.domains || []).some((d) => d.host === host)) {
+    console.log(`domain ok   ${host} already attached`);
+  } else {
+    const port = Number(fileEnv.PORT || 3000);
+    const domain = await tryRoutes([
+      ['POST', 'domain.create', { host, path: '/', port, https: true, applicationId, certificateType: 'letsencrypt', domainType: 'application' }],
+    ]);
+    if (!domain.ok) throw new Error(`could not create domain: ${JSON.stringify(domain.attempts)}`);
+    console.log(`domain set  https://${host} -> :${port}  (via ${domain.route})`);
+  }
 }
 
 function envBlock() {
@@ -184,7 +256,15 @@ async function deploy() {
   console.log(`deploy triggered via ${r.route}`);
 }
 
-const commands = { probe, find: show, show, 'push-env': pushEnv, deploy, setup: async () => { await pushEnv(); await deploy(); } };
+const commands = {
+  probe,
+  find: show,
+  show,
+  configure,
+  'push-env': pushEnv,
+  deploy,
+  setup: async () => { await configure(); await pushEnv(); await deploy(); },
+};
 
 const cmd = process.argv[2] || 'probe';
 const fn = commands[cmd];
