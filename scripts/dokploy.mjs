@@ -214,18 +214,33 @@ async function configure() {
 
   // WebSub will not deliver without a public HTTPS callback, so the domain is
   // part of configuration rather than a nicety.
-  const host = (fileEnv.PUBLIC_URL || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
-  if (!host) {
+  const publicUrl = fileEnv.PUBLIC_URL || '';
+  const host = publicUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  // Scheme is authoritative: Let's Encrypt refuses shared domains like
+  // sslip.io, so an http:// PUBLIC_URL must not get a cert-bearing router or
+  // the edge answers every TLS handshake with an internal error.
+  const https = publicUrl.startsWith('https://');
+  // This server fronts 80/443 with Caddy, which only serves hosts written into
+  // its own config — a Dokploy domain record never reaches it. An IP:port
+  // PUBLIC_URL means we are bypassing the edge via a published port instead,
+  // so there is no domain to attach.
+  if (/^\d+\.\d+\.\d+\.\d+(:\d+)?$/.test(host)) {
+    console.log(`domain      skipped (PUBLIC_URL is a published port: ${publicUrl})`);
+  } else if (!host) {
     console.log('domain      skipped (PUBLIC_URL is empty)');
-  } else if ((app.domains || []).some((d) => d.host === host)) {
-    console.log(`domain ok   ${host} already attached`);
   } else {
     const port = Number(fileEnv.PORT || 3000);
-    const domain = await tryRoutes([
-      ['POST', 'domain.create', { host, path: '/', port, https: true, applicationId, certificateType: 'letsencrypt', domainType: 'application' }],
-    ]);
-    if (!domain.ok) throw new Error(`could not create domain: ${JSON.stringify(domain.attempts)}`);
-    console.log(`domain set  https://${host} -> :${port}  (via ${domain.route})`);
+    const existing = (app.domains || []).find((d) => d.host === host);
+    if (existing && existing.https === https && existing.port === port) {
+      console.log(`domain ok   ${publicUrl} already attached`);
+    } else {
+      const payload = { host, path: '/', port, https, applicationId, domainType: 'application', certificateType: https ? 'letsencrypt' : 'none' };
+      const domain = existing
+        ? await tryRoutes([['POST', 'domain.update', { domainId: existing.domainId, ...payload }]])
+        : await tryRoutes([['POST', 'domain.create', payload]]);
+      if (!domain.ok) throw new Error(`could not save domain: ${JSON.stringify(domain.attempts)}`);
+      console.log(`domain set  ${publicUrl} -> :${port}  (via ${domain.route})`);
+    }
   }
 }
 
