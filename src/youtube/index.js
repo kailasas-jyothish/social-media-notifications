@@ -58,7 +58,18 @@ export async function start() {
   for (const input of config.youtube.channels) {
     if (!(await addChannel(input))) unresolved.push(input);
   }
-  if (!channels.length) throw new Error('no YouTube channel could be resolved');
+  // Not fatal even when every channel failed. Resolution needs the API, and the
+  // API can be down or out of daily quota at the moment the container happens
+  // to boot; throwing here would leave no timers running at all, so nothing
+  // would ever retry and YouTube would stay dead until someone restarted it by
+  // hand. The pollers cope with an empty channel list and the retry below
+  // brings them back on their own.
+  if (!channels.length) {
+    log.error(
+      `no YouTube channel resolved yet (${unresolved.length} pending retry) — ` +
+        'starting anyway; the uploads tick retries one per interval',
+    );
+  }
 
   migrateSeedFlag();
 
