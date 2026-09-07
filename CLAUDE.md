@@ -117,6 +117,26 @@ Technical facts that were verified empirically and matter:
   request body bytes** — hence `express.raw()` on those two routes only.
 - WebSub lease caps at 5 days; re-subscribe is idempotent, so it runs on boot
   and every 12h.
+- **The `/live` probe flooded Slack, and this is the shape of the bug.** Its id
+  extraction fell back to `/"videoId"\s*:\s*"([\w-]{11})"/` over the whole page
+  when the canonical link didn't match. A live watch page carries ~30 unrelated
+  `videoId`s in its recommendation rail, so that fallback returned strangers'
+  videos — Sadhguru, handpan music, The Diary Of A CEO — each announced as
+  "LIVE NOW" on this channel. ~113 such posts before it was caught (2026-09-07).
+  Two independent things were wrong and both are now fixed:
+  1. `readLivePage()` accepts an id only from a page-level marker (canonical
+     link → `og:video:url` → `"videoDetails"`), never from a loose page-wide
+     match. When the channel isn't live, `/live` doesn't redirect, so the
+     absence of such a marker *is* the "not live" answer.
+  2. `src/youtube/owner.js` is a hard ownership gate every YouTube event passes
+     through. Feed/WebSub entries carry `yt:channelId` and are compared for
+     free; bare ids are attributed via `videos.list` (with a key) or **oEmbed**
+     (`/oembed?url=…` → `author_url` = the owning channel's `@handle`; free,
+     keyless, cookieless, ~400 bytes). It **fails closed** — an id that cannot
+     be attributed is not announced.
+  - `GET /admin/probe` reports what the *container* reads off that page.
+    YouTube serves datacenter IPs a different page shape than a laptop, so a
+    local test is not evidence about production. Check it there, not here.
 - Shorts have no API flag. Cheap filter: `contentDetails.duration` ≤ 180s (the
   limit rose from 60s in Oct 2024). Definitive test: `GET /shorts/<id>` with
   redirects disabled — 200 means Short, 303 means not.
@@ -138,6 +158,7 @@ src/http.js           fetch with timeout/retry/browser UA, every() safe interval
 src/youtube/api.js    channel resolve, videos.list, Shorts probe, /live probe
 src/youtube/feed.js   Atom parse; feedUrl vs topicUrls (see §4)
 src/youtube/detect.js classify a videoId -> live/upcoming/short/video, announce
+src/youtube/owner.js  ownership gate: is this videoId actually on our channel?
 src/youtube/websub.js subscribe/renew both topic forms, HMAC-SHA1 verify
 src/youtube/index.js  orchestration: seed, subscribe, 3 pollers
 src/facebook/graph.js Graph client, HMAC-SHA256 verify, permalink builders
@@ -210,6 +231,11 @@ the entire Facebook path, and every Dokploy API call.
   *what*. Match that.
 - Every new detector must route through `announce()` in `src/notify.js`. Never
   call `postEvent`/`postMessage` directly from a detector.
+- Any YouTube detector that produces a bare video id must clear
+  `owner.verify()` first. Scraped pages contain other channels' ids; treating
+  one as ours is how the Slack flood happened.
+- Never extract an id with a page-wide regex over YouTube HTML. Anchor it to a
+  page-level marker (canonical link, `og:*`, `"videoDetails"`).
 - Never introduce a cookie-based or logged-in-scraping approach. That was an
   explicit, load-bearing constraint of the original request.
 - Prefer 1-unit YouTube API calls. If a change would add a `search.list` poll,

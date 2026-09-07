@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { log } from '../log.js';
 import { announce, suppress } from '../notify.js';
 import { addWatch, dropWatch, hasSeen } from '../store.js';
+import { verify } from './owner.js';
 import {
   hasApiKey,
   videosList,
@@ -19,8 +20,18 @@ import {
  * `mode` = 'notify' (default) or 'seed' (record as handled, post nothing).
  */
 export async function handleVideo(videoId, hint = {}, mode = 'notify') {
+  const owner = await verify(videoId, hint);
+  if (!owner.own) {
+    log.debug(`ignoring ${videoId}: not published by the watched channel`);
+    return false;
+  }
+
   const item = hasApiKey() ? (await videosList([videoId]))[0] : null;
-  const event = await classify(videoId, item, hint);
+  const event = await classify(videoId, item, {
+    ...hint,
+    title: hint.title || owner.title,
+    author: hint.author || owner.author,
+  });
   if (!event) return false;
 
   if (mode === 'seed') {
@@ -81,14 +92,20 @@ async function classify(videoId, item, hint) {
 
 /** Announce a live stream detected by the channel /live probe (no API key needed). */
 export async function handleLiveDetected(videoId, hint = {}) {
+  const owner = await verify(videoId, hint);
+  if (!owner.own) {
+    log.warn(`live probe surfaced ${videoId}, which is not on the watched channel — ignored`);
+    return false;
+  }
+
   dropWatch(videoId);
   return announce({
     platform: 'youtube',
     kind: 'live',
     id: videoId,
     url: watchUrl(videoId),
-    title: hint.title || '',
-    author: hint.author || '',
+    title: hint.title || owner.title || '',
+    author: hint.author || owner.author || '',
     thumbnail: thumbUrl(videoId),
     source: hint.source || 'live-probe',
   });

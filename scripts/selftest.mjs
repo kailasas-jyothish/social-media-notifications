@@ -9,6 +9,7 @@
  */
 import { config } from '../src/config.js';
 import { resolveChannelId, hasApiKey, videosList, isShort, probeChannelLive } from '../src/youtube/api.js';
+import { setOwner, verify, ownerHandle } from '../src/youtube/owner.js';
 import { fetchFeed } from '../src/youtube/feed.js';
 import { postPlain } from '../src/slack.js';
 import { graph } from '../src/facebook/graph.js';
@@ -44,7 +45,17 @@ await check('Shorts redirect probe', async () => {
 
 await check('channel /live probe (no API key needed)', async () => {
   const live = await probeChannelLive(channelId);
-  return live ? `LIVE NOW: ${live.videoId} "${live.title}"` : 'not currently live';
+  return live ? `LIVE NOW: ${live.videoId} "${live.title}" (via ${live.via})` : 'not currently live';
+});
+
+// The gate that stops the /live probe's recommendation rail reaching Slack.
+await check('ownership gate', async () => {
+  await setOwner(channelId);
+  const mine = await verify(latest.videoId);
+  const theirs = await verify('H0_-an5hio8'); // a Sadhguru video the old probe posted
+  if (!mine.own) throw new Error(`own video ${latest.videoId} was rejected`);
+  if (theirs.own) throw new Error('a foreign video was accepted');
+  return `handle=${ownerHandle() || 'none'}; accepts own, rejects "${theirs.author || 'unknown'}"`;
 });
 
 await check('YouTube Data API key', async () => {

@@ -136,6 +136,16 @@ export function createServer() {
     }
   });
 
+  // YouTube serves datacenter IPs a different page shape than a laptop, so the
+  // only trustworthy view of the /live probe is the container's own.
+  app.get('/admin/probe', requireAdmin, async (_req, res) => {
+    try {
+      res.json({ ok: true, ...(await youtube.probeDiagnostics()) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.post('/admin/resubscribe', requireAdmin, async (_req, res) => {
     const id = youtube.getChannelId();
     if (!id) return res.status(409).json({ ok: false, error: 'channel not resolved yet' });

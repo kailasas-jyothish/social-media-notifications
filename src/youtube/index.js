@@ -1,10 +1,11 @@
 import { config } from '../config.js';
 import { log } from '../log.js';
-import { every } from '../http.js';
+import { every, getText } from '../http.js';
 import { isSeeded, setSeeded, setMeta, getMeta, watchIds, dropWatch, watchInfo, flushIfDirty } from '../store.js';
 import { fetchFeed, parseAtom } from './feed.js';
-import { resolveChannelId, hasApiKey, videosList, probeChannelLive } from './api.js';
+import { resolveChannelId, hasApiKey, videosList, probeChannelLive, readLivePage, oembed } from './api.js';
 import { handleVideo, handleLiveDetected } from './detect.js';
+import { setOwner, ownerHandle, verify } from './owner.js';
 import { subscribe } from './websub.js';
 
 let channelId = null;
@@ -16,6 +17,7 @@ export async function start() {
   channelId = await resolveChannelId(config.youtube.channel);
   setMeta('youtubeChannelId', channelId);
   log.info(`youtube channel resolved: ${config.youtube.channel} -> ${channelId}`);
+  await setOwner(channelId);
 
   // First run: mark everything currently in the feed as handled so we don't
   // dump the last 15 videos into Slack.
@@ -23,7 +25,11 @@ export async function start() {
     try {
       const { entries } = await fetchFeed(channelId);
       for (const e of entries) {
-        await handleVideo(e.videoId, { title: e.title, author: e.author, published: e.published }, 'seed');
+        await handleVideo(
+          e.videoId,
+          { title: e.title, author: e.author, published: e.published, channelId: e.channelId },
+          'seed',
+        );
       }
       setSeeded('youtube');
       flushIfDirty();
@@ -70,7 +76,13 @@ export async function handlePush(xml) {
   for (const e of entries) {
     await handleVideo(
       e.videoId,
-      { title: e.title, author: e.author, published: e.published, source: 'websub push' },
+      {
+        title: e.title,
+        author: e.author,
+        published: e.published,
+        channelId: e.channelId,
+        source: 'websub push',
+      },
       'notify',
     );
   }
@@ -90,6 +102,7 @@ async function pollWatchlist() {
       await handleLiveDetected(item.id, {
         title: item.snippet?.title,
         author: item.snippet?.channelTitle,
+        channelId: item.snippet?.channelId,
         source: 'live watchlist',
       });
     } else if (live?.actualEndTime || lbc === 'none') {
@@ -111,6 +124,21 @@ async function pollChannelLive() {
   await handleLiveDetected(live.videoId, { title: live.title, source: 'channel /live probe' });
 }
 
+/** What the /live probe sees right now, and whether that video is ours. */
+export async function probeDiagnostics() {
+  if (!channelId) return { error: 'channel not resolved yet' };
+  const html = await getText(`https://www.youtube.com/channel/${channelId}/live`, { retries: 0 });
+  const read = readLivePage(html);
+  return {
+    channelId,
+    handle: ownerHandle(),
+    probe: read,
+    owned: read.videoId ? (await verify(read.videoId)).own : null,
+    oembed: read.videoId ? await oembed(read.videoId) : null,
+    wouldAnnounce: read.live && read.videoId ? (await verify(read.videoId)).own : false,
+  };
+}
+
 async function pollRss() {
   if (!channelId) return;
   const { entries } = await fetchFeed(channelId);
@@ -118,7 +146,13 @@ async function pollRss() {
   for (const e of entries) {
     await handleVideo(
       e.videoId,
-      { title: e.title, author: e.author, published: e.published, source: 'rss backstop' },
+      {
+        title: e.title,
+        author: e.author,
+        published: e.published,
+        channelId: e.channelId,
+        source: 'rss backstop',
+      },
       'notify',
     );
   }
