@@ -44,7 +44,10 @@ export const config = {
     uploadsPollSeconds: num(process.env.YOUTUBE_UPLOADS_POLL_SECONDS, 30),
     websubEnabled: bool(process.env.YOUTUBE_WEBSUB_ENABLED, false),
     shortMaxSeconds: num(process.env.YOUTUBE_SHORT_MAX_SECONDS, 180),
-    notifyUpcoming: bool(process.env.YOUTUBE_NOTIFY_UPCOMING, true),
+    // One card per stream, fired when it actually goes live. A scheduled
+    // stream is still watched either way — this only controls whether its
+    // announcement also gets a card.
+    notifyUpcoming: bool(process.env.YOUTUBE_NOTIFY_UPCOMING, false),
   },
 
   facebook: {
