@@ -60,6 +60,35 @@ export async function videosList(ids, parts = 'snippet,contentDetails,liveStream
   return out;
 }
 
+/** Every channel's uploads live in a playlist whose id is its own with UC->UU. */
+export const uploadsPlaylistId = (channelId) => `UU${channelId.slice(2)}`;
+
+/**
+ * Recent uploads via playlistItems.list — 1 quota unit, same shape as the Atom
+ * feed. Preferred over the RSS backstop because it talks to googleapis.com
+ * with a key: youtube.com serves this container 404s and 500s for the feed,
+ * which is the same datacenter-IP throttling that made the /live scrape
+ * unreliable in the first place.
+ */
+export async function recentUploads(channelId, max = 15) {
+  if (!hasApiKey()) return [];
+  const data = await getJson(
+    `${API}/playlistItems?part=snippet,contentDetails&maxResults=${max}` +
+      `&playlistId=${uploadsPlaylistId(channelId)}&key=${config.youtube.apiKey}`,
+  );
+  return (data.items || [])
+    .map((it) => ({
+      videoId: it.contentDetails?.videoId,
+      title: it.snippet?.title,
+      author: it.snippet?.videoOwnerChannelTitle || it.snippet?.channelTitle,
+      published: it.contentDetails?.videoPublishedAt || it.snippet?.publishedAt,
+      // The uploader, not the playlist owner — they match here, but the
+      // ownership gate should never be handed the looser of the two.
+      channelId: it.snippet?.videoOwnerChannelId || it.snippet?.channelId,
+    }))
+    .filter((e) => e.videoId);
+}
+
 /** Best thumbnail available from a snippet. */
 export function bestThumb(snippet) {
   const t = snippet?.thumbnails || {};

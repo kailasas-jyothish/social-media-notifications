@@ -8,7 +8,14 @@
  * (if configured) the Facebook Page token.
  */
 import { config } from '../src/config.js';
-import { resolveChannelId, hasApiKey, videosList, isShort, probeChannelLive } from '../src/youtube/api.js';
+import {
+  resolveChannelId,
+  hasApiKey,
+  videosList,
+  isShort,
+  probeChannelLive,
+  recentUploads,
+} from '../src/youtube/api.js';
 import { setOwner, verify, ownerHandle } from '../src/youtube/owner.js';
 import { fetchFeed } from '../src/youtube/feed.js';
 import { postPlain } from '../src/slack.js';
@@ -36,6 +43,15 @@ await check('fetch + parse Atom feed', async () => {
   const { entries } = await fetchFeed(channelId);
   latest = entries[0];
   return `${entries.length} entries, newest: ${latest?.videoId} "${latest?.title}"`;
+});
+
+// The primary path on the server: youtube.com's feed 404s from that IP.
+await check('recent uploads via API', async () => {
+  if (!hasApiKey()) return 'skipped (YOUTUBE_API_KEY unset — RSS is the only route)';
+  const items = await recentUploads(channelId);
+  const foreign = items.filter((e) => e.channelId !== channelId);
+  if (foreign.length) throw new Error(`${foreign.length} items are not from this channel`);
+  return `${items.length} uploads, newest: ${items[0]?.videoId} "${items[0]?.title}"`;
 });
 
 await check('Shorts redirect probe', async () => {

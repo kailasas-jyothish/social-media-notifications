@@ -3,7 +3,15 @@ import { log } from '../log.js';
 import { every, getText } from '../http.js';
 import { isSeeded, setSeeded, setMeta, getMeta, watchIds, dropWatch, watchInfo, flushIfDirty } from '../store.js';
 import { fetchFeed, parseAtom } from './feed.js';
-import { resolveChannelId, hasApiKey, videosList, probeChannelLive, readLivePage, oembed } from './api.js';
+import {
+  resolveChannelId,
+  hasApiKey,
+  videosList,
+  probeChannelLive,
+  readLivePage,
+  oembed,
+  recentUploads,
+} from './api.js';
 import { handleVideo, handleLiveDetected } from './detect.js';
 import { setOwner, ownerHandle, verify } from './owner.js';
 import { subscribe } from './websub.js';
@@ -23,7 +31,7 @@ export async function start() {
   // dump the last 15 videos into Slack.
   if (!isSeeded('youtube')) {
     try {
-      const { entries } = await fetchFeed(channelId);
+      const { entries } = await recentEntries();
       for (const e of entries) {
         await handleVideo(
           e.videoId,
@@ -56,7 +64,7 @@ export async function start() {
   timers.push(every(config.youtube.liveProbeSeconds, 'yt-live-probe', pollChannelLive));
 
   // Backstop for dropped WebSub deliveries.
-  timers.push(every(config.youtube.rssPollSeconds, 'yt-rss', pollRss));
+  timers.push(every(config.youtube.rssPollSeconds, 'yt-recent', pollRecent));
 
   log.info('youtube detectors running');
 }
@@ -139,20 +147,30 @@ export async function probeDiagnostics() {
   };
 }
 
-async function pollRss() {
+/**
+ * Recent uploads, by whichever route works. The API is tried first: this
+ * container gets 404s and 500s from youtube.com's feed endpoint, so the RSS
+ * path is the fallback here rather than the primary.
+ */
+async function recentEntries() {
+  if (hasApiKey()) {
+    try {
+      return { entries: await recentUploads(channelId), source: 'uploads poll' };
+    } catch (err) {
+      log.warn(`playlistItems poll failed (${err.message}); falling back to RSS`);
+    }
+  }
+  return { entries: (await fetchFeed(channelId)).entries, source: 'rss backstop' };
+}
+
+async function pollRecent() {
   if (!channelId) return;
-  const { entries } = await fetchFeed(channelId);
+  const { entries, source } = await recentEntries();
   const lastSeenId = getMeta('youtubeLastFeedId');
   for (const e of entries) {
     await handleVideo(
       e.videoId,
-      {
-        title: e.title,
-        author: e.author,
-        published: e.published,
-        channelId: e.channelId,
-        source: 'rss backstop',
-      },
+      { title: e.title, author: e.author, published: e.published, channelId: e.channelId, source },
       'notify',
     );
   }
