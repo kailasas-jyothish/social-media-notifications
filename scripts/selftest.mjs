@@ -26,35 +26,44 @@ const check = async (name, fn) => {
   }
 };
 
-let channelId;
+// Newest upload of the first channel that yields one, for the videos.list and
+// Shorts probes below.
 let latest;
 
-await check('resolve YouTube channel', async () => {
-  channelId = await resolveChannelId(config.youtube.channel);
-  return `${config.youtube.channel} -> ${channelId}`;
-});
+for (const channel of config.youtube.channels) {
+  let channelId;
 
-await check('recent uploads via API', async () => {
-  const items = await recentUploads(channelId);
-  const foreign = items.filter((item) => item.channelId !== channelId);
-  if (foreign.length) {
-    throw new Error(
-      `${foreign.length} item(s) are not from ${channelId}: ` +
-        foreign.map((item) => `${item.videoId}:${item.channelId || 'missing'}`).join(', '),
-    );
-  }
-  latest = items[0];
-  if (!latest) throw new Error('playlistItems.list returned no uploads');
-  return `${items.length} uploads, newest: ${latest.videoId} "${latest.title}"`;
-});
+  await check(`resolve ${channel}`, async () => {
+    channelId = await resolveChannelId(channel);
+    return `-> ${channelId}`;
+  });
+
+  await check(`recent uploads ${channel}`, async () => {
+    if (!channelId) throw new Error('skipped (channel did not resolve)');
+    const items = await recentUploads(channelId);
+    const foreign = items.filter((item) => item.channelId !== channelId);
+    if (foreign.length) {
+      throw new Error(
+        `${foreign.length} item(s) are not from ${channelId}: ` +
+          foreign.map((item) => `${item.videoId}:${item.channelId || 'missing'}`).join(', '),
+      );
+    }
+    const newest = items[0];
+    if (!newest) throw new Error('playlistItems.list returned no uploads');
+    latest ??= newest;
+    return `${items.length} uploads, newest: ${newest.videoId} "${newest.title}"`;
+  });
+}
 
 await check('YouTube Data API key', async () => {
+  if (!latest) throw new Error('no upload found on any channel to test with');
   const items = await videosList([latest.videoId]);
   const it = items[0];
   return it ? `videos.list ok: liveBroadcastContent=${it.snippet.liveBroadcastContent}, duration=${it.contentDetails?.duration}` : 'no items returned';
 });
 
 await check('Shorts redirect probe', async () => {
+  if (!latest) throw new Error('no upload found on any channel to test with');
   const short = await isShort(latest.videoId);
   if (short === null) return `${latest.videoId}: inconclusive`;
   return `${latest.videoId} is ${short ? 'a Short' : 'not a Short'}`;

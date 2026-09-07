@@ -112,8 +112,8 @@ export function createServer() {
       publicUrl: config.publicUrl,
       youtube: {
         enabled: config.youtube.enabled,
-        channel: config.youtube.channel,
-        channelId: youtube.getChannelId(),
+        configured: config.youtube.channels,
+        channels: youtube.getChannels(),
         apiKey: Boolean(config.youtube.apiKey),
         callback: config.publicUrl ? `${config.publicUrl}${CALLBACK_PATH}` : null,
       },
@@ -136,18 +136,20 @@ export function createServer() {
     }
   });
 
-  app.get('/admin/recent', requireAdmin, async (_req, res) => {
+  app.get('/admin/recent', requireAdmin, async (req, res) => {
     try {
-      res.json({ ok: true, ...(await youtube.recentReport()) });
+      res.json({ ok: true, ...(await youtube.recentReport(req.query.channel || '')) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
   });
 
   app.post('/admin/resubscribe', requireAdmin, async (_req, res) => {
-    const id = youtube.getChannelId();
-    if (!id) return res.status(409).json({ ok: false, error: 'channel not resolved yet' });
-    res.json({ ok: await subscribe(id) });
+    const ids = youtube.getChannelIds();
+    if (!ids.length) return res.status(409).json({ ok: false, error: 'no channel resolved yet' });
+    const results = {};
+    for (const id of ids) results[id] = await subscribe(id).catch((err) => err.message);
+    res.json({ ok: Object.values(results).some((v) => v === true), results });
   });
 
   app.use((req, res) => res.status(404).json({ ok: false, error: `no route ${req.method} ${req.path}` }));

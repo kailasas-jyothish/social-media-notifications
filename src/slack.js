@@ -72,7 +72,11 @@ const PLATFORM = {
 export async function postEvent(event) {
   const style = STYLE[event.kind] || { emoji: '📣', label: event.kind };
   const platform = PLATFORM[event.platform] || event.platform;
-  const heading = `${style.emoji} ${platform} — ${style.label}`;
+  // Several channels feed one Slack channel, so the heading names the author:
+  // "which of them is live" is the first question a reader has, and the small
+  // grey context line is the wrong place to answer it.
+  const who = (event.author || '').trim();
+  const heading = `${style.emoji} ${platform}${who ? ` · ${who}` : ''} — ${style.label}`;
   const title = (event.title || '').trim() || event.url;
 
   const blocks = [
@@ -80,7 +84,7 @@ export async function postEvent(event) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*${heading}*\n<${event.url}|${escapeMrkdwn(truncate(title, 200))}>`,
+        text: `*${escapeMrkdwn(heading)}*\n<${event.url}|${escapeMrkdwn(truncate(title, 200))}>`,
       },
       ...(event.thumbnail
         ? { accessory: { type: 'image', image_url: event.thumbnail, alt_text: truncate(title, 60) } }
@@ -93,7 +97,6 @@ export async function postEvent(event) {
   ];
 
   const contextBits = [];
-  if (event.author) contextBits.push(escapeMrkdwn(event.author));
   if (event.publishedAt) contextBits.push(`<!date^${Math.floor(new Date(event.publishedAt).getTime() / 1000)}^{date_short_pretty} {time}|${event.publishedAt}>`);
   if (event.source) contextBits.push(`via ${event.source}`);
   if (contextBits.length) {

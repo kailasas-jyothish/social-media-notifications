@@ -23,7 +23,9 @@ async function main() {
   facebook.start().catch((err) => log.error(`facebook start failed: ${err.message}`));
 
   if (config.slack.startupPing) {
-    postPlain(`:satellite: social-media-notifications started — watching ${config.youtube.channel}`).catch(
+    postPlain(
+      `:satellite: social-media-notifications started — watching ${config.youtube.channels.join(', ')}`,
+    ).catch(
       (err) => log.warn(`startup ping failed: ${err.message}`),
     );
   }

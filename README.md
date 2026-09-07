@@ -1,13 +1,24 @@
 # social-media-notifications
 
-Watches a YouTube channel and a Facebook Page and drops the link into Slack the
-moment anything goes out — a video, a Short/Reel, a post, or a live stream
-starting.
+Watches a set of YouTube channels and a Facebook Page and drops the link into
+Slack the moment anything goes out — a video, a Short/Reel, a post, or a live
+stream starting.
 
 No cookies. No browser session. No logged-in scraping.
 
-Default target: [`@kailasasanjoseus`](https://www.youtube.com/@kailasasanjoseus)
-→ Slack channel `C0C0PGXT46L`.
+Default targets → Slack channel `C0C0PGXT46L`:
+
+| Channel | Id |
+|---|---|
+| [`@kailasasanjoseus`](https://www.youtube.com/@kailasasanjoseus) | `UCT08Oyc76TM1Cn84mzwuGaA` |
+| [`@KailasaLA`](https://www.youtube.com/@KailasaLA) | `UCq4_WXUpm8ein5ou4qESDcQ` |
+| [`@kailasahouston9302`](https://www.youtube.com/@kailasahouston9302) | `UCl2cPxGNvohKD012qhU_NVQ` |
+| [`@kailasaohio7452`](https://www.youtube.com/@kailasaohio7452) | `UCQUOYoDKqvPTi0iXvytDyng` |
+| [`@kailasatoronto8217`](https://www.youtube.com/@kailasatoronto8217) | `UCRg-BvocTHMhQfvGfpt3W1A` |
+| [`@KailasaSG`](https://www.youtube.com/@KailasaSG) | `UC9GvlY2FoWOBEj0pz1hOCVw` |
+
+Override with `YOUTUBE_CHANNELS` (comma-separated handles, channel URLs or raw
+`UC…` ids). Every card names the channel it came from.
 
 ---
 
@@ -15,9 +26,9 @@ Default target: [`@kailasasanjoseus`](https://www.youtube.com/@kailasasanjoseus)
 
 | Platform | Detection | Latency | What it needs |
 |---|---|---|---|
-| YouTube — new video / Short / premiere | WebSub (PubSubHubbub) **push** from Google | seconds | a public HTTPS URL. That's it. |
-| YouTube — **live stream start** | `videos.list` watchlist poll + free `/live` page probe | ~20–30 s | a free YouTube Data API key (optional but recommended) |
-| YouTube — dropped pushes | RSS backstop poll | 60 s | nothing |
+| YouTube — new video / Short / premiere | `playlistItems.list` poll of each channel's uploads | ≤ 30 s × channel count (3 min for six) | a free YouTube Data API key |
+| YouTube — **live stream start**, scheduled | `videos.list` poll of the watchlist, every channel in one call | ~20 s | the same key |
+| YouTube — **live stream start**, unscheduled | picked up by the uploads poll | ≤ 30 s × channel count | the same key |
 | Facebook — posts / photos / videos / reels | Graph API `feed` **webhook** | 1–5 s | a Page access token |
 | Facebook — live start | Graph API `live_videos` webhook | 1–5 s | a Page access token |
 | Facebook — missed webhooks | Graph edge poll | 60 s | a Page access token |
@@ -72,8 +83,9 @@ switches on the day the token exists.
 Every detector funnels through one `announce()` call keyed on
 `platform:kind:id`, so overlapping detectors can never double-post. State lives
 in a JSON file under `DATA_DIR`, so restarts and redeploys don't replay old
-content. First boot seeds the store from the existing feed silently — you will
-not get a flood of the last 15 videos.
+content. Seeding is silent and **per channel**, so a channel added later has its
+own back catalogue recorded rather than replayed into Slack, and the channels
+already being watched are untouched.
 
 ### Endpoints
 
@@ -85,7 +97,8 @@ not get a flood of the last 15 videos.
 | `GET  /webhooks/facebook` | Meta verification handshake |
 | `POST /webhooks/facebook` | signed page events from Meta |
 | `POST /ingest` | generic inbox (`x-ingest-token` header) |
-| `GET  /status` | full runtime state (`x-admin-token`) |
+| `GET  /status` | full runtime state, incl. resolved channels (`x-admin-token`) |
+| `GET  /admin/recent` | what the API reports per channel now; `?channel=@handle` for one |
 | `POST /admin/test` | post a test message to Slack |
 | `POST /admin/resubscribe` | force a WebSub lease renewal |
 
@@ -101,15 +114,24 @@ not get a flood of the last 15 videos.
 4. In Slack, open the target channel and run `/invite @YourBotName`.
 5. `SLACK_CHANNEL_ID=C0C0PGXT46L` is already set.
 
-### 2. YouTube API key (optional, recommended)
+### 2. YouTube API key (required)
 
 https://console.cloud.google.com → new project → enable **YouTube Data API v3**
 → Credentials → **API key** → `YOUTUBE_API_KEY`.
 
-The bot polls at 1 quota unit per call (never `search.list`, which costs 100),
-so the default 10,000 units/day is roughly 5× more headroom than it uses.
-Without a key, everything still works except live-start detection falls back to
-the free page probe and Shorts are detected by redirect only.
+Every call costs 1 quota unit (never `search.list`, which costs 100), and the
+free allowance is 10,000 units/day. The uploads poll takes **one channel per
+tick**, round-robin, so that cost does not grow with the number of channels —
+86400/`YOUTUBE_UPLOADS_POLL_SECONDS` + 86400/`YOUTUBE_LIVE_POLL_SECONDS` ≈
+7,200/day at the defaults, whatever the channel count. What grows instead is
+how long it takes to come back round to any one channel: 30 s × 6 = 3 minutes.
+
+Shortening the interval to buy latency is what would break the budget — six
+channels polled every 30 s each would be 17,280 units/day. If you need faster
+than 3 minutes on an *unscheduled* go-live, either request a quota increase for
+the project or split the channels across two keys/deployments. Scheduled
+streams and premieres are unaffected: once discovered they sit on the watchlist,
+which is polled for all channels in a single call every 20 s.
 
 ### 3. Deploy on Dokploy
 
@@ -184,7 +206,7 @@ x-ingest-token: <INGEST_TOKENS value>
 
 ```bash
 npm install
-npm run selftest          # checks channel, feed, Shorts probe, live probe, Slack
+npm run selftest          # resolves every channel, lists uploads, Shorts probe, Slack
 npm run dev               # runs with --env-file=.env and --watch
 docker compose up --build # full container run
 ```
@@ -197,9 +219,15 @@ it posts one message to Slack if a token is configured, and skips cleanly if not
 ## Configuration
 
 Every variable is documented in [`.env.example`](.env.example). The ones that
-matter: `PUBLIC_URL`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, `YOUTUBE_CHANNEL`,
+matter: `PUBLIC_URL`, `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, `YOUTUBE_CHANNELS`,
 `YOUTUBE_API_KEY`, and the Facebook block.
 
-Notable defaults: live watchlist poll 20 s, `/live` probe 30 s, RSS backstop
-60 s, Facebook poll 60 s, WebSub lease renewed every 12 h (Google caps leases at
-5 days).
+`YOUTUBE_CHANNELS` is comma-separated. The older single-channel
+`YOUTUBE_CHANNEL` is still read and unioned in, so an existing deployment keeps
+working — but a deployment whose env sets only `YOUTUBE_CHANNEL` watches only
+that one channel. Check `GET /status` after deploying: `youtube.channels` should
+list every channel you expect.
+
+Notable defaults: live watchlist poll 20 s, uploads poll 30 s per tick (one
+channel per tick), Facebook poll 60 s, WebSub off, and — when enabled — a
+WebSub lease renewed every 12 h (Google caps leases at 5 days).

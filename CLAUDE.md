@@ -172,8 +172,8 @@ Dockerfile            node:22-alpine, /data volume, healthcheck on /healthz
 
 | Poller | Call | Cost | Job |
 |---|---|---|---|
-| `yt-uploads` (30s) | `playlistItems.list` on `UU…` | 1 unit | discovers every video, Short and stream |
-| `yt-pending` (20s) | `videos.list` on the watchlist | 1 unit | catches a scheduled stream going live |
+| `yt-uploads` (30s) | `playlistItems.list` on one channel's `UU…`, round-robin | 1 unit | discovers every video, Short and stream |
+| `yt-pending` (20s) | `videos.list` on the watchlist (all channels, one call) | 1 unit | catches a scheduled stream going live |
 
 A second `videos.list` runs only when the uploads poll finds an unseen id.
 WebSub is retained but **off by default** (`YOUTUBE_WEBSUB_ENABLED=false`):
@@ -181,10 +181,11 @@ Google's hub answers this deployment 503, and polling already meets the
 requirement. Facebook: `feed` + `live_videos` webhooks (1–5s) → Graph edge poll
 (60s).
 
-**First boot seeds silently**, and seeding is owned by `pollUploads`, not
+**First boot seeds silently**, and seeding is owned by `pollChannel`, not
 `start()`. A transient API error during a boot-time seed used to leave the flag
 unset while the pollers ran anyway, so the next good poll would post the whole
-back catalogue. Now it stays in seed mode until it actually succeeds.
+back catalogue. Now it stays in seed mode until it actually succeeds. The flag
+is per channel (`seeded['youtube:<UC…>']`) — see §10.
 
 `scripts/dokploy.mjs` is written defensively on purpose — the Dokploy API shape
 was never verified (no key yet). It first tries `/swagger`, `/swagger/json`,
@@ -221,6 +222,11 @@ the entire Facebook path, and every Dokploy API call.
 
 ## 7. Open items / next steps
 
+0. **Set `YOUTUBE_CHANNELS` in the Dokploy app's env** (see §10) and drop the old
+   `YOUTUBE_CHANNEL`. A deployment whose env still sets only the singular
+   variable watches only that one channel — the six-channel list is a code
+   default, and an explicit env value wins over it. Confirm with `GET /status`:
+   `youtube.channels` must list all six.
 1. **Dokploy** — user to fill `DOKPLOY_URL` + `DOKPLOY_API_KEY` in `.env`, then
    run `node scripts/dokploy.mjs probe` and adapt the script to the real API.
 2. **Slack bot token** — `xoxb-…` with `chat:write`, then `/invite` the bot into
@@ -246,9 +252,10 @@ the entire Facebook path, and every Dokploy API call.
   That host serves this deployment throttled 404s, 500s and pages with no
   canonical link; `googleapis.com` with the API key is reliable. Every id must
   be expanded through `videos.list` and gated on
-  `snippet.channelId === getMeta('youtubeChannelId')` before it can be
+  `getMeta('youtubeChannelIds').includes(snippet.channelId)` before it can be
   announced — that comparison is the only thing standing between the Slack
-  channel and another channel's video.
+  channel and another channel's video. It fails closed: an item with no
+  `snippet.channelId` is dropped, never assumed to be ours.
 - Treat an absent `videoOwnerChannelId` from `playlistItems` as *unknown*, never
   as ours. Falling back to `snippet.channelId` there means assuming ownership
   rather than establishing it.
@@ -341,3 +348,70 @@ Codex's review produced one confident false positive (claiming
 `uploadsPollSeconds` was undefined when it is in `config.js`), so verify its
 line-number claims against the file — the reasoning was sound, the coordinates
 drifted.
+
+---
+
+## 10. Multi-channel YouTube (2026-09-07, later the same day)
+
+The user asked to watch five more channels alongside San Jose:
+
+| Handle | Channel id |
+|---|---|
+| `@kailasasanjoseus` | `UCT08Oyc76TM1Cn84mzwuGaA` |
+| `@KailasaLA` | `UCq4_WXUpm8ein5ou4qESDcQ` |
+| `@kailasahouston9302` | `UCl2cPxGNvohKD012qhU_NVQ` |
+| `@kailasaohio7452` | `UCQUOYoDKqvPTi0iXvytDyng` |
+| `@kailasatoronto8217` | `UCRg-BvocTHMhQfvGfpt3W1A` |
+| `@KailasaSG` | `UC9GvlY2FoWOBEj0pz1hOCVw` |
+
+All six verified live via `channels.list?forHandle` + `playlistItems.list`
+(50 uploads each). `config.youtube.channel` became `config.youtube.channels`
+(`YOUTUBE_CHANNELS`, comma-separated; the old singular `YOUTUBE_CHANNEL` is
+unioned in, not replaced, so a deployment that still sets it keeps working).
+
+**The quota ceiling is what shapes this design.** `playlistItems.list` takes one
+playlist per call and there is no batched alternative — `search.list` is 100
+units and `activities.list` is also per channel — so six channels polled every
+30s each would be 17,280 units/day against a 10,000/day free allowance, and
+going over means 403 for the rest of the day rather than slower polling. So the
+uploads poller checks **one channel per tick, round-robin**: cost stays at
+86400/`uploadsPollSeconds` regardless of channel count, and the price is
+latency — any one channel comes round every `uploadsPollSeconds × channelCount`
+(3 min for six). The watchlist poller is unaffected: `videos.list` takes 50 ids
+per unit, so every channel's pending streams are checked in a single call and
+scheduled go-lives keep their ~20s precision. Baseline is therefore unchanged
+from §9: ~2,880/day plus ~4,320 when a stream is pending. `configProblems()`
+now computes that sum and warns above 9,000/day.
+
+To go faster than 3 min on an *unscheduled* go-live, the options are a quota
+increase on the Cloud project or splitting channels across two keys — not a
+shorter interval.
+
+Three things that would break if changed carelessly:
+
+- **The seed flag is per channel** (`seeded['youtube:<UC…>']`). A single shared
+  flag would mean a channel added later is treated as already seeded, and its
+  whole 50-item back catalogue posts to Slack. `migrateSeedFlag()` carries the
+  old single `seeded.youtube` over to the id in `meta.youtubeChannelId` on
+  first boot after the upgrade — without it San Jose re-seeds, and re-seeding
+  posts nothing, which is the problem: a stream live at that moment would be
+  recorded as backlog and never announced.
+- **The ownership gate is now a list**, `meta.youtubeChannelIds`, written as
+  each channel resolves. `detect.js` fails closed on an absent or unlisted
+  `snippet.channelId`. This is the §9 flood guard; keep it a whitelist test.
+- **A channel that fails to resolve at boot is not dropped.** It goes on an
+  `unresolved` list and one entry is retried per uploads tick, so a transient
+  `channels.list` error does not silently stop watching a channel for the
+  lifetime of the container. Boot throws only if *no* channel resolves.
+
+Slack cards now carry the channel title in the heading
+(`🔴 YouTube · KAILASA LA — LIVE NOW`) instead of the small grey context line —
+with six channels feeding one Slack channel, "which one is live" is the first
+question a reader has.
+
+Verified: `scripts/selftest.mjs` resolves all six and lists uploads for each;
+a full boot against a scratch `DATA_DIR` seeded all six silently (299 keys, one
+upcoming stream on the watchlist, `meta.youtubeChannelIds` correct); and a boot
+against a hand-written pre-multi-channel `state.json` logged the seed-flag
+migration and skipped re-seeding San Jose. Not verified: behaviour in the
+Dokploy container, and an actual go-live on one of the five new channels.

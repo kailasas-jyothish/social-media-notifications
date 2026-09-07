@@ -21,9 +21,13 @@ export const alreadyHandled = (videoId) => KINDS.some((k) => hasSeen(`youtube:${
  * `mode` = 'notify' (default) or 'seed' (record as handled, post nothing).
  */
 export async function handleItem(item, hint = {}, mode = 'notify') {
-  const watched = getMeta('youtubeChannelId');
-  if (item.snippet?.channelId !== watched) {
-    log.warn(`ignoring ${item.id}: published by ${item.snippet?.channelId}, not ${watched}`);
+  // Fails closed: an id whose owner is absent, or is not one of the resolved
+  // channels, is never announced. This comparison is the only thing standing
+  // between the Slack channel and another channel's video.
+  const watched = getMeta('youtubeChannelIds', []);
+  const owner = item.snippet?.channelId;
+  if (!owner || !watched.includes(owner)) {
+    log.warn(`ignoring ${item.id}: published by ${owner || 'unknown'}, not a watched channel`);
     return false;
   }
 

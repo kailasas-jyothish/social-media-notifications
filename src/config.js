@@ -16,6 +16,23 @@ const list = (v) =>
 
 const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 
+// The KAILASA channel network. Handles resolve to UC... ids at boot.
+const DEFAULT_YOUTUBE_CHANNELS = [
+  '@kailasasanjoseus',
+  '@KailasaLA',
+  '@kailasahouston9302',
+  '@kailasaohio7452',
+  '@kailasatoronto8217',
+  '@KailasaSG',
+];
+
+// YOUTUBE_CHANNELS is the current variable; YOUTUBE_CHANNEL (singular) is the
+// one this project shipped with and is unioned in rather than replaced, so an
+// existing deployment's env keeps working. Neither set means watch the network.
+const youtubeChannels = [
+  ...new Set([...list(process.env.YOUTUBE_CHANNELS), ...list(process.env.YOUTUBE_CHANNEL)]),
+];
+
 export const config = {
   port: num(process.env.PORT, 3000),
   publicUrl,
@@ -31,8 +48,8 @@ export const config = {
 
   youtube: {
     enabled: bool(process.env.YOUTUBE_ENABLED, true),
-    // Either a handle (@name), a channel URL, or a raw UC... id.
-    channel: process.env.YOUTUBE_CHANNEL || '@kailasasanjoseus',
+    // Each entry is a handle (@name), a channel URL, or a raw UC... id.
+    channels: youtubeChannels.length ? youtubeChannels : DEFAULT_YOUTUBE_CHANNELS,
     apiKey: process.env.YOUTUBE_API_KEY || '',
     // Secret used for the WebSub HMAC. Auto-generated if unset (regenerates on
     // restart, which only means the next re-subscribe rotates it).
@@ -41,6 +58,11 @@ export const config = {
     leaseSeconds: num(process.env.YOUTUBE_LEASE_SECONDS, 432000),
     resubscribeSeconds: num(process.env.YOUTUBE_RESUBSCRIBE_SECONDS, 12 * 3600),
     livePollSeconds: num(process.env.YOUTUBE_LIVE_POLL_SECONDS, 20),
+    // One channel is checked per tick, round-robin, so the API cost of
+    // discovery is fixed no matter how many channels are watched — what grows
+    // is the time to come back round to any one of them
+    // (uploadsPollSeconds x channel count). See the quota note in api.js
+    // before shortening this.
     uploadsPollSeconds: num(process.env.YOUTUBE_UPLOADS_POLL_SECONDS, 30),
     websubEnabled: bool(process.env.YOUTUBE_WEBSUB_ENABLED, false),
     shortMaxSeconds: num(process.env.YOUTUBE_SHORT_MAX_SECONDS, 180),
@@ -83,6 +105,19 @@ export function configProblems() {
   }
   if (config.youtube.enabled && !config.youtube.apiKey) {
     p.push('YOUTUBE_API_KEY is now required when YouTube is enabled.');
+  }
+  if (config.youtube.enabled) {
+    // playlistItems (1 unit/tick, round-robin) + videos.list on the watchlist
+    // (1 unit/tick). The default 10,000 units/day is the ceiling; going over
+    // means 403 for the rest of the day, not slower polling.
+    const daily =
+      86400 / config.youtube.uploadsPollSeconds + 86400 / config.youtube.livePollSeconds;
+    if (daily > 9000) {
+      p.push(
+        `YouTube polling intervals imply ~${Math.round(daily)} quota units/day, close to or over ` +
+          'the 10,000/day default. Raise YOUTUBE_UPLOADS_POLL_SECONDS / YOUTUBE_LIVE_POLL_SECONDS.',
+      );
+    }
   }
   if (config.youtube.enabled && config.youtube.websubEnabled && !config.publicUrl) {
     p.push('PUBLIC_URL is not set — YouTube WebSub push cannot be subscribed; falling back to polling only.');
