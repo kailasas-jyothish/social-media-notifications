@@ -261,7 +261,9 @@ async function pollPending() {
  * channel, so it is admin-only and accepts ?channel= to look at just one.
  */
 export async function recentReport(filter = '') {
-  if (!channels.length) return { error: 'no channel resolved yet' };
+  // Report the pending list here too: "nothing resolved" is exactly the state
+  // in which you want to see what it is still retrying.
+  if (!channels.length) return { error: 'no channel resolved yet', unresolved };
   const wanted = String(filter).trim().toLowerCase();
   const selected = wanted
     ? channels.filter((c) => c.id.toLowerCase() === wanted || c.input.toLowerCase() === wanted)
