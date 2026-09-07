@@ -222,13 +222,16 @@ the entire Facebook path, and every Dokploy API call.
 
 ## 7. Open items / next steps
 
-0. **Set `YOUTUBE_CHANNELS` in the Dokploy app's env** (see §10) and drop the old
-   `YOUTUBE_CHANNEL`. A deployment whose env still sets only the singular
-   variable watches only that one channel — the six-channel list is a code
-   default, and an explicit env value wins over it. Confirm with `GET /status`:
-   `youtube.channels` must list all six.
-1. **Dokploy** — user to fill `DOKPLOY_URL` + `DOKPLOY_API_KEY` in `.env`, then
-   run `node scripts/dokploy.mjs probe` and adapt the script to the real API.
+0. ~~Dokploy setup~~ **done**: the app is deployed from
+   `github.com/kailasas-jyothish/social-media-notifications` @ `main`, env is
+   pushed (`YOUTUBE_CHANNELS`, no singular `YOUTUBE_CHANNEL`), and
+   `node scripts/dokploy.mjs deploy` now genuinely rolls the container — see the
+   start-first Swarm trap in §10 before trusting a `done` deployment again.
+1. **YouTube API quota** is the live constraint, not hosting. The key was
+   exhausted (403) on the first multi-channel deploy. Steady state for the new
+   code is ~7,200 units/day of the 10,000 free allowance; if it exhausts again,
+   check Cloud Console → APIs & Services → YouTube Data API v3 → Metrics for
+   what else is spending it before shortening any interval.
 2. **Slack bot token** — `xoxb-…` with `chat:write`, then `/invite` the bot into
    `C0C0PGXT46L`. Confirm with `POST /admin/test`.
 3. **YouTube Data API key** — optional, free; makes live-start detection ~20s
@@ -408,6 +411,58 @@ Slack cards now carry the channel title in the heading
 (`🔴 YouTube · KAILASA LA — LIVE NOW`) instead of the small grey context line —
 with six channels feeding one Slack channel, "which one is live" is the first
 question a reader has.
+
+### The deploy that never deployed (found while shipping this)
+
+**Every Dokploy deploy since this app was created reported `done` in 1–4s and
+never replaced the running container.** The app publishes host ports 8477 and
+8478 (`publishMode: host`, both → 3000) with `replicas: 1`, and
+`updateConfigSwarm` was `null`, so Swarm used **start-first**: the new task can
+never bind ports the old task still holds, so it sat unschedulable while the
+old container kept serving. `docker service update` returns immediately, so
+Dokploy recorded success. What actually changed the running code was an
+unrelated container restart picking up the last-built image — which is why
+production was still running `a4d286d` (the pre-rewrite scrape code, with
+`/admin/probe` present and `/admin/recent` absent) hours after §9's rewrite was
+committed.
+
+Fixed by setting `updateConfigSwarm` to `{"Parallelism":1,"Order":"stop-first"}`
+via `application.update`. Note the shape: that endpoint's zod schema wants
+Docker's **PascalCase** keys, and rejects `{parallelism, order}` with a bare
+"Input validation failed". Deploys now roll the container properly, at the cost
+of a few seconds of downtime — correct for one replica holding host ports.
+
+Diagnosing this without shell access to the host: `docker.getContainersByAppNameMatch`
+(`?appName=<app.appName>`) answers 200 for this API key and shows container
+age, which is the only reliable proof a deploy took effect. Most other
+`docker.*` and `traefikFiles` routes answer 401 for this key. `deployment.all`
+reports `status: done` regardless, so **never trust it as evidence** — check
+container age or `/status` on the app itself.
+
+Also: port 8477 is a leftover duplicate of 8478 and nothing references it.
+`autoDeploy` is off, so `POST /api/deploy/<refreshToken>` answers "Automatic
+deployments are disabled" (and, once enabled, "Branch Not Match" unless the
+body carries `ref: refs/heads/main`).
+
+### Quota exhaustion on the first multi-channel boot
+
+The first deploy came up with `403 exceeded your quota` on `channels.list`, so
+five of six handles did not resolve. Two things came out of it:
+
+- `start()` no longer throws when *no* channel resolves. It used to, which left
+  no timers running at all — nothing would retry, and YouTube stayed dead until
+  someone restarted the container by hand. It now starts anyway and the uploads
+  tick retries one unresolved channel per interval, so the app heals itself when
+  quota resets (midnight Pacific).
+- **A stale-content guard was added** (`YOUTUBE_MAX_AGE_HOURS`, default 24).
+  San Jose's stored dedupe set was built by the old code from a 15-entry feed,
+  while discovery now reads 50 uploads — so the difference (~15–35 old videos)
+  would have posted to Slack as new the moment quota returned. `isStale()` in
+  `detect.js` records a finished video older than the cutoff via `suppress()`
+  instead of announcing it. Live and upcoming are exempt: a broadcast can be
+  created weeks before it starts, and a stream going live today is news however
+  old its video object is. This also protects against a wiped `/data` volume
+  replaying a back catalogue.
 
 Verified: `scripts/selftest.mjs` resolves all six and lists uploads for each;
 a full boot against a scratch `DATA_DIR` seeded all six silently (299 keys, one

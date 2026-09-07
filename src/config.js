@@ -66,6 +66,13 @@ export const config = {
     uploadsPollSeconds: num(process.env.YOUTUBE_UPLOADS_POLL_SECONDS, 30),
     websubEnabled: bool(process.env.YOUTUBE_WEBSUB_ENABLED, false),
     shortMaxSeconds: num(process.env.YOUTUBE_SHORT_MAX_SECONDS, 180),
+    // A finished video this old is history, not news, whatever the dedupe
+    // store believes. Discovery reads the newest 50 uploads, so any gap in
+    // that store — a wiped volume, a channel seeded from a smaller window,
+    // keys pruned — would otherwise replay the back catalogue into Slack.
+    // Live and upcoming streams are exempt: a broadcast can be created weeks
+    // before it starts.
+    maxAgeHours: num(process.env.YOUTUBE_MAX_AGE_HOURS, 24),
     // One card per stream, fired when it actually goes live. A scheduled
     // stream is still watched either way — this only controls whether its
     // announcement also gets a card.

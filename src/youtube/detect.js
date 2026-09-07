@@ -34,7 +34,7 @@ export async function handleItem(item, hint = {}, mode = 'notify') {
   const event = await classify(item, hint);
   if (!event) return false;
 
-  if (mode === 'seed') {
+  if (mode === 'seed' || isStale(event)) {
     suppress(event);
     return false;
   }
@@ -54,6 +54,22 @@ export async function handleItem(item, hint = {}, mode = 'notify') {
   if (event.kind === 'live' && hasSeen(`youtube:live:${item.id}`)) dropWatch(item.id);
 
   return posted;
+}
+
+/**
+ * A finished video old enough that announcing it would be reporting history.
+ * Recorded as handled rather than dropped, so it is not re-judged every poll.
+ * Streams are never stale by age — one can be scheduled weeks ahead, and a
+ * broadcast that starts today is news however long ago it was created.
+ */
+function isStale(event) {
+  if (event.kind === 'live' || event.kind === 'upcoming') return false;
+  const published = Date.parse(event.publishedAt ?? '');
+  if (!Number.isFinite(published)) return false;
+  const age = Date.now() - published;
+  if (age <= config.youtube.maxAgeHours * 3600 * 1000) return false;
+  log.debug(`suppressing ${event.kind} ${event.id}: published ${Math.round(age / 3600000)}h ago`);
+  return true;
 }
 
 /** Fetch details for ids and handle them. One quota unit per 50 ids. */
