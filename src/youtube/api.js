@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { getJson, getText, get } from '../http.js';
+import { getJson, get } from '../http.js';
 import { log } from '../log.js';
 
 const API = 'https://www.googleapis.com/youtube/v3';
@@ -7,10 +7,15 @@ const API = 'https://www.googleapis.com/youtube/v3';
 export const hasApiKey = () => Boolean(config.youtube.apiKey);
 
 /**
- * Resolve "@handle", a channel URL, or a raw UC... id to a channel id.
- * Works without an API key by scraping the public channel page for the
- * canonical /channel/UC... URL — no cookies, no login.
+ * Quota budget (default 10,000 units/day):
+ *   playlistItems.list  1 unit  @30s = 2,880/day   discovers new content
+ *   videos.list         1 unit  @20s = 4,320/day   only while a stream is pending
+ *   videos.list         1 unit  per poll that finds new ids
+ * Well inside the free tier. search.list costs 100 and is never used — one
+ * poll every 14 minutes is all it would buy.
  */
+
+/** Resolve "@handle", a channel URL, or a raw UC... id to a channel id. */
 export async function resolveChannelId(input) {
   const raw = String(input || '').trim();
 
@@ -22,56 +27,27 @@ export async function resolveChannelId(input) {
   if (fromUrl) handle = fromUrl[1];
   if (!handle.startsWith('@')) handle = `@${handle.replace(/^\/+/, '')}`;
 
-  if (hasApiKey()) {
-    try {
-      const data = await getJson(
-        `${API}/channels?part=id,snippet&forHandle=${encodeURIComponent(handle)}&key=${config.youtube.apiKey}`,
-      );
-      const id = data?.items?.[0]?.id;
-      if (id) return id;
-      log.warn(`channels.list?forHandle=${handle} returned no items; falling back to page scrape`);
-    } catch (err) {
-      log.warn(`channels.list failed (${err.message}); falling back to page scrape`);
-    }
-  }
-
-  const html = await getText(`https://www.youtube.com/${handle}`);
-  const m =
-    html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/) ||
-    html.match(/"externalId":"(UC[\w-]{22})"/) ||
-    html.match(/"channelId":"(UC[\w-]{22})"/);
-  if (!m) throw new Error(`could not resolve channel id for ${raw}`);
-  return m[1];
-}
-
-/**
- * videos.list — 1 quota unit per call, up to 50 ids. This is the cheap way to
- * watch for a live stream actually starting (search.list costs 100/call).
- */
-export async function videosList(ids, parts = 'snippet,contentDetails,liveStreamingDetails') {
-  if (!hasApiKey() || ids.length === 0) return [];
-  const out = [];
-  for (let i = 0; i < ids.length; i += 50) {
-    const chunk = ids.slice(i, i + 50);
-    const url = `${API}/videos?part=${parts}&id=${chunk.join(',')}&key=${config.youtube.apiKey}`;
-    const data = await getJson(url);
-    out.push(...(data.items || []));
-  }
-  return out;
+  const data = await getJson(
+    `${API}/channels?part=id&forHandle=${encodeURIComponent(handle)}&key=${config.youtube.apiKey}`,
+  );
+  const id = data?.items?.[0]?.id;
+  if (!id) throw new Error(`channels.list returned no channel for ${handle}`);
+  return id;
 }
 
 /** Every channel's uploads live in a playlist whose id is its own with UC->UU. */
 export const uploadsPlaylistId = (channelId) => `UU${channelId.slice(2)}`;
 
 /**
- * Recent uploads via playlistItems.list — 1 quota unit, same shape as the Atom
- * feed. Preferred over the RSS backstop because it talks to googleapis.com
- * with a key: youtube.com serves this container 404s and 500s for the feed,
- * which is the same datacenter-IP throttling that made the /live scrape
- * unreliable in the first place.
+ * Recent uploads — this is the trigger for everything. New videos, Shorts and
+ * live streams all land here, so one cheap call per poll is the whole
+ * discovery mechanism.
+ *
+ * 50 is the page maximum and costs the same single unit as 15. The margin
+ * matters: anything pushed out of this window between two successful polls is
+ * never seen, and an outage or exhausted quota can mean a long gap.
  */
-export async function recentUploads(channelId, max = 15) {
-  if (!hasApiKey()) return [];
+export async function recentUploads(channelId, max = 50) {
   const data = await getJson(
     `${API}/playlistItems?part=snippet,contentDetails&maxResults=${max}` +
       `&playlistId=${uploadsPlaylistId(channelId)}&key=${config.youtube.apiKey}`,
@@ -80,13 +56,26 @@ export async function recentUploads(channelId, max = 15) {
     .map((it) => ({
       videoId: it.contentDetails?.videoId,
       title: it.snippet?.title,
-      author: it.snippet?.videoOwnerChannelTitle || it.snippet?.channelTitle,
       published: it.contentDetails?.videoPublishedAt || it.snippet?.publishedAt,
-      // The uploader, not the playlist owner — they match here, but the
-      // ownership gate should never be handed the looser of the two.
-      channelId: it.snippet?.videoOwnerChannelId || it.snippet?.channelId,
+      // The uploader specifically, with no fall back to snippet.channelId —
+      // that is the playlist's owner, so falling back would have the effect of
+      // assuming ownership rather than establishing it. Absent means unknown,
+      // and callers treat unknown as "ask videos.list", never as "ours".
+      channelId: it.snippet?.videoOwnerChannelId ?? null,
     }))
     .filter((e) => e.videoId);
+}
+
+/** videos.list — 1 unit for up to 50 ids. Gives kind, duration and live state. */
+export async function videosList(ids, parts = 'snippet,contentDetails,liveStreamingDetails') {
+  if (ids.length === 0) return [];
+  const out = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const url = `${API}/videos?part=${parts}&id=${ids.slice(i, i + 50).join(',')}&key=${config.youtube.apiKey}`;
+    const data = await getJson(url);
+    out.push(...(data.items || []));
+  }
+  return out;
 }
 
 /** Best thumbnail available from a snippet. */
@@ -105,135 +94,31 @@ export function isoDurationSeconds(iso) {
 }
 
 /**
- * Definitive Shorts test: /shorts/<id> returns 200 for a real Short and
- * redirects to /watch?v=<id> for anything else. Free, no quota.
+ * The API has no Shorts flag, so this is the one call that isn't the API:
+ * /shorts/<id> answers 200 for a real Short and redirects for anything else.
+ * It reads the status code only — no page is downloaded or parsed.
+ *
+ * Returns true / false / null, and the null matters: youtube.com serves this
+ * deployment throttled 404s and 500s, which say nothing about the video. A
+ * throttled response must not be read as "not a Short" or every Short would be
+ * posted as an ordinary video.
  */
 export async function isShort(videoId) {
   try {
     const res = await get(`https://www.youtube.com/shorts/${videoId}`, {
+      method: 'HEAD',
       redirect: 'manual',
       retries: 0,
       timeoutMs: 8000,
     });
-    return res.status === 200;
+    if (res.status === 200) return true;
+    if (res.status >= 300 && res.status < 400) return false;
+    log.debug(`shorts probe inconclusive for ${videoId}: ${res.status}`);
+    return null;
   } catch (err) {
     log.debug(`shorts probe failed for ${videoId}: ${err.message}`);
-    return false;
-  }
-}
-
-/**
- * Cookie-free probe of https://www.youtube.com/channel/<id>/live.
- * Catches streams that went live without ever existing as a scheduled video,
- * and works even with no API key at all.
- */
-export async function probeChannelLive(channelId) {
-  const html = await getText(`https://www.youtube.com/channel/${channelId}/live`, { retries: 0 });
-  const read = readLivePage(html);
-  return read.live ? { videoId: read.videoId, title: read.title, via: read.via } : null;
-}
-
-/**
- * Extract the live video from a /live page.
- *
- * Only page-level markers are trusted. A live watch page carries ~30 unrelated
- * `"videoId"` values in its recommendation rail, so matching the first one
- * anywhere in the HTML returns some stranger's video — that is precisely how
- * this probe once flooded Slack with links to Sadhguru and handpan music.
- * When the channel is not live the /live URL does not redirect, so the absence
- * of a page-level watch id is itself the "not live" answer.
- *
- * Exported for the /admin/probe diagnostic, which shows what the deployed
- * container sees (YouTube serves datacenter IPs a different page shape than a
- * laptop, so guessing is not good enough).
- */
-export function readLivePage(html) {
-  const canonical = html.match(
-    /<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/,
-  );
-  const ogVideo = html.match(
-    /<meta property="og:video:url" content="https:\/\/www\.youtube\.com\/embed\/([\w-]{11})/,
-  );
-  // "videoDetails":{"videoId":"…"} — the player's own record of what is playing.
-  const details = html.match(/"videoDetails"\s*:\s*\{[^{}]*?"videoId"\s*:\s*"([\w-]{11})"/);
-
-  const hit = canonical || ogVideo || details;
-  const via = canonical ? 'canonical' : ogVideo ? 'og:video:url' : details ? 'videoDetails' : null;
-  const isLive = /"isLive"\s*:\s*true/.test(html) || /"isLiveNow"\s*:\s*true/.test(html);
-  const titleMatch = html.match(/<meta name="title" content="([^"]*)"/);
-
-  return {
-    live: Boolean(hit && isLive),
-    videoId: hit ? hit[1] : null,
-    via,
-    isLive,
-    title: titleMatch ? decodeHtml(titleMatch[1]) : '',
-    htmlLength: html.length,
-  };
-}
-
-/**
- * oEmbed — free, keyless, no cookies, ~400 bytes. `author_url` names the
- * owning channel, which makes this the cheapest ownership check available
- * without an API key. Also supplies the title the /live probe cannot read.
- */
-export async function oembed(videoId) {
-  try {
-    const data = await getJson(
-      `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl(videoId))}&format=json`,
-      { retries: 1, timeoutMs: 8000 },
-    );
-    return {
-      title: data.title || '',
-      author: data.author_name || '',
-      handle: handleFromUrl(data.author_url),
-      thumbnail: data.thumbnail_url,
-    };
-  } catch (err) {
-    log.debug(`oembed failed for ${videoId}: ${err.message}`);
     return null;
   }
-}
-
-/** The @handle a channel id canonically lives at, or null if it has none. */
-export async function resolveChannelHandle(channelId) {
-  const html = await getText(`https://www.youtube.com/channel/${channelId}`);
-  const m =
-    html.match(/"canonicalBaseUrl"\s*:\s*"\/(@[\w.\-]+)"/) ||
-    html.match(/"vanityChannelUrl"\s*:\s*"https?:\/\/www\.youtube\.com\/(@[\w.\-]+)"/);
-  return m ? m[1].toLowerCase() : null;
-}
-
-/**
- * The owning channel id of a single video, read from the player's own record
- * rather than from anywhere in the page (see readLivePage). Last-resort check
- * for channels with no @handle and no API key.
- */
-export async function fetchVideoChannelId(videoId) {
-  try {
-    const html = await getText(watchUrl(videoId), { retries: 0 });
-    const at = html.indexOf('"videoDetails"');
-    const scope = at === -1 ? html : html.slice(at, at + 4000);
-    const m = scope.match(/"channelId"\s*:\s*"(UC[\w-]{22})"/);
-    return m ? m[1] : null;
-  } catch (err) {
-    log.debug(`channel-id lookup failed for ${videoId}: ${err.message}`);
-    return null;
-  }
-}
-
-const handleFromUrl = (u) => {
-  const m = String(u || '').match(/youtube\.com\/(@[\w.\-]+)/i);
-  return m ? m[1].toLowerCase() : null;
-};
-
-function decodeHtml(s) {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
 }
 
 export const watchUrl = (id) => `https://www.youtube.com/watch?v=${id}`;

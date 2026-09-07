@@ -59,8 +59,19 @@ export async function getText(url, opts = {}) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Run fn on an interval, never letting a rejection kill the timer. */
+/**
+ * Run fn on an interval, never letting a rejection kill the timer.
+ *
+ * A missing config value would arrive here as undefined, and setInterval
+ * clamps a NaN delay to 1ms — which would spend a whole day's API quota in
+ * under a minute. Refuse instead: a detector that fails loudly at boot is
+ * recoverable, one that silently hammers the API is not.
+ */
 export function every(seconds, name, fn) {
+  const ms = Number(seconds) * 1000;
+  if (!Number.isFinite(ms) || ms < 1000) {
+    throw new Error(`[${name}] refusing interval of ${seconds}s — check the matching config value`);
+  }
   const tick = async () => {
     try {
       await fn();
@@ -68,7 +79,7 @@ export function every(seconds, name, fn) {
       log.error(`[${name}] ${err.message}`);
     }
   };
-  const t = setInterval(tick, seconds * 1000);
+  const t = setInterval(tick, ms);
   t.unref?.();
   return { stop: () => clearInterval(t), runNow: tick };
 }

@@ -4,7 +4,11 @@ import { config } from './config.js';
 import { log } from './log.js';
 
 const FILE = path.join(config.dataDir, 'state.json');
-const SEEN_TTL_MS = 45 * 24 * 3600 * 1000;
+// "Announce once, ever" only holds while the key outlives the discovery window.
+// A pruned key on a video still inside the newest-N uploads reads as brand new
+// and reposts it, so this must comfortably exceed the time the channel takes to
+// publish N items. At ~40 bytes a key that is a few hundred KB a year.
+const SEEN_TTL_MS = 400 * 24 * 3600 * 1000;
 
 const empty = () => ({
   version: 1,

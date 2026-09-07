@@ -41,8 +41,8 @@ export const config = {
     leaseSeconds: num(process.env.YOUTUBE_LEASE_SECONDS, 432000),
     resubscribeSeconds: num(process.env.YOUTUBE_RESUBSCRIBE_SECONDS, 12 * 3600),
     livePollSeconds: num(process.env.YOUTUBE_LIVE_POLL_SECONDS, 20),
-    liveProbeSeconds: num(process.env.YOUTUBE_LIVE_PROBE_SECONDS, 30),
-    rssPollSeconds: num(process.env.YOUTUBE_RSS_POLL_SECONDS, 60),
+    uploadsPollSeconds: num(process.env.YOUTUBE_UPLOADS_POLL_SECONDS, 30),
+    websubEnabled: bool(process.env.YOUTUBE_WEBSUB_ENABLED, false),
     shortMaxSeconds: num(process.env.YOUTUBE_SHORT_MAX_SECONDS, 180),
     notifyUpcoming: bool(process.env.YOUTUBE_NOTIFY_UPCOMING, true),
   },
@@ -78,7 +78,10 @@ export function configProblems() {
   if (config.slack.botToken && !config.slack.channel) {
     p.push('SLACK_BOT_TOKEN is set but SLACK_CHANNEL_ID is missing.');
   }
-  if (config.youtube.enabled && !config.publicUrl) {
+  if (config.youtube.enabled && !config.youtube.apiKey) {
+    p.push('YOUTUBE_API_KEY is now required when YouTube is enabled.');
+  }
+  if (config.youtube.enabled && config.youtube.websubEnabled && !config.publicUrl) {
     p.push('PUBLIC_URL is not set — YouTube WebSub push cannot be subscribed; falling back to polling only.');
   }
   if (config.facebook.enabled && (!config.facebook.pageId || !config.facebook.pageToken)) {

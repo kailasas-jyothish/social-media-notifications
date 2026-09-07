@@ -151,16 +151,15 @@ Technical facts that were verified empirically and matter:
 src/index.js          boot, graceful shutdown, periodic state flush
 src/config.js         env parsing + configProblems() warnings
 src/server.js         all HTTP routes (raw-body handling for signed webhooks)
-src/store.js          JSON dedupe/watchlist store, atomic writes, 45-day prune
+src/store.js          JSON dedupe/watchlist store, atomic writes, 400-day prune
 src/notify.js         announce() — the single dedupe gate; re-arms on Slack failure
 src/slack.js          chat.postMessage + Block Kit cards, rate-limit retry
 src/http.js           fetch with timeout/retry/browser UA, every() safe interval
-src/youtube/api.js    channel resolve, videos.list, Shorts probe, /live probe
-src/youtube/feed.js   Atom parse; feedUrl vs topicUrls (see §4)
-src/youtube/detect.js classify a videoId -> live/upcoming/short/video, announce
-src/youtube/owner.js  ownership gate: is this videoId actually on our channel?
+src/youtube/api.js    channels/playlistItems/videos.list — API only
+src/youtube/feed.js   Atom parse + topicUrls, for WebSub payloads only
+src/youtube/detect.js classify an API item -> live/upcoming/short/video, announce
 src/youtube/websub.js subscribe/renew both topic forms, HMAC-SHA1 verify
-src/youtube/index.js  orchestration: seed, subscribe, 3 pollers
+src/youtube/index.js  orchestration: 2 pollers, seeding, /admin/recent report
 src/facebook/graph.js Graph client, HMAC-SHA256 verify, permalink builders
 src/facebook/index.js feed + live_videos webhook handling, Graph edge poll
 scripts/selftest.mjs  offline credential/behaviour check
@@ -168,12 +167,24 @@ scripts/dokploy.mjs   Dokploy API driver: probe / show / push-env / deploy / set
 Dockerfile            node:22-alpine, /data volume, healthcheck on /healthz
 ```
 
-Detection layers, YouTube: WebSub push (seconds) → `videos.list` watchlist poll
-(20s) → free `/live` probe (30s) → RSS backstop (60s).
-Facebook: `feed` + `live_videos` webhooks (1–5s) → Graph edge poll (60s).
+**YouTube detection is API-only — two pollers, nothing else** (rewritten
+2026-09-07, see §9):
 
-**First boot seeds silently** from the existing feed, so deploying does not dump
-the last 15 videos into Slack.
+| Poller | Call | Cost | Job |
+|---|---|---|---|
+| `yt-uploads` (30s) | `playlistItems.list` on `UU…` | 1 unit | discovers every video, Short and stream |
+| `yt-pending` (20s) | `videos.list` on the watchlist | 1 unit | catches a scheduled stream going live |
+
+A second `videos.list` runs only when the uploads poll finds an unseen id.
+WebSub is retained but **off by default** (`YOUTUBE_WEBSUB_ENABLED=false`):
+Google's hub answers this deployment 503, and polling already meets the
+requirement. Facebook: `feed` + `live_videos` webhooks (1–5s) → Graph edge poll
+(60s).
+
+**First boot seeds silently**, and seeding is owned by `pollUploads`, not
+`start()`. A transient API error during a boot-time seed used to leave the flag
+unset while the pollers ran anyway, so the next good poll would post the whole
+back catalogue. Now it stays in seed mode until it actually succeeds.
 
 `scripts/dokploy.mjs` is written defensively on purpose — the Dokploy API shape
 was never verified (no key yet). It first tries `/swagger`, `/swagger/json`,
@@ -231,11 +242,16 @@ the entire Facebook path, and every Dokploy API call.
   *what*. Match that.
 - Every new detector must route through `announce()` in `src/notify.js`. Never
   call `postEvent`/`postMessage` directly from a detector.
-- Any YouTube detector that produces a bare video id must clear
-  `owner.verify()` first. Scraped pages contain other channels' ids; treating
-  one as ours is how the Slack flood happened.
-- Never extract an id with a page-wide regex over YouTube HTML. Anchor it to a
-  page-level marker (canonical link, `og:*`, `"videoDetails"`).
+- **Never scrape youtube.com.** Not the feed, not `/live`, not a watch page.
+  That host serves this deployment throttled 404s, 500s and pages with no
+  canonical link; `googleapis.com` with the API key is reliable. Every id must
+  be expanded through `videos.list` and gated on
+  `snippet.channelId === getMeta('youtubeChannelId')` before it can be
+  announced — that comparison is the only thing standing between the Slack
+  channel and another channel's video.
+- Treat an absent `videoOwnerChannelId` from `playlistItems` as *unknown*, never
+  as ours. Falling back to `snippet.channelId` there means assuming ownership
+  rather than establishing it.
 - Never introduce a cookie-based or logged-in-scraping approach. That was an
   explicit, load-bearing constraint of the original request.
 - Prefer 1-unit YouTube API calls. If a change would add a `search.list` poll,
@@ -250,3 +266,78 @@ the entire Facebook path, and every Dokploy API call.
   optimistic one. They asked directly whether the approach would work; the
   honest split answer (YouTube yes, Facebook blocked on Page rights) is what
   they wanted.
+
+---
+
+## 9. The 2026-09-07 rewrite — why YouTube detection is API-only
+
+The original design layered a scraped `/live` HTML probe and an RSS feed on top
+of the API, as free fallbacks for running without an API key. Both turned out to
+be actively harmful from the Dokploy host:
+
+- `GET /admin/recent`'s predecessor showed the container receiving a 1.18 MB
+  `/live` page containing `"isLive":true` but **no canonical link, no
+  `og:video:url`, no `videoDetails`** — i.e. no trustworthy video id anywhere.
+  A laptop gets a normal page for the same URL. Datacenter IPs are throttled.
+- `https://www.youtube.com/feeds/videos.xml?channel_id=…` returned **404 and
+  500** to the container on nearly every poll while working fine locally.
+
+The old probe's fallback regex matched the first `"videoId"` in that HTML, which
+is a recommendation, so ~113 unrelated videos (Sadhguru, handpan music, The
+Diary Of A CEO, CANAL+ Sport) were posted to Slack as "LIVE NOW" on this
+channel. **The lesson is not "parse the HTML better" — it is that youtube.com is
+not a data source for this deployment.**
+
+A YouTube Data API key was added, everything scraped was deleted, and discovery
+became `playlistItems.list` on the uploads playlist. Shorts are now decided by
+duration (≤180s) alone: the definitive `/shorts/<id>` redirect probe is a
+youtube.com request, so on this host it returns no information while adding 8s
+per candidate. A misjudged short clip gets the wrong label; the link works
+either way.
+
+### Bugs found in review that are worth not reintroducing
+
+Both were caught by an adversarial review of the rewrite, not by testing:
+
+- **`dropWatch()` before `announce()`.** A stream flipping to live was removed
+  from the watchlist and only then posted. On a Slack 429/5xx, `announce()`
+  re-arms the dedupe key for retry — but the watchlist was the only thing that
+  would retry it. The live notification was lost. `dropWatch` now runs only
+  once `hasSeen` confirms the key stuck.
+- **Watchlist eviction on `addedAt`.** A stream scheduled >30 days out was
+  evicted before starting, and its lingering `youtube:upcoming:<id>` key made
+  `alreadyHandled()` refuse to rediscover it, so the go-live could never fire.
+  Eviction is now based on `scheduledStartTime` + 7 days.
+
+Also: `every()` in `src/http.js` refuses an interval below 1s. A missing config
+value arrives as `undefined`, and `setInterval(NaN)` is clamped by Node to 1ms,
+which would spend the entire 10,000-unit daily quota in well under a minute and
+then 403 for the rest of the day. `store.js` keeps dedupe keys for 400 days, not
+45: a pruned key on a video still inside the 50-item discovery window reads as
+new and reposts it.
+
+### Quota
+
+Baseline ~2,880/day (uploads only, watchlist empty). With a stream pending all
+day, ~7,200. The theoretical worst case — a new id on every single 30s poll —
+is ~10,080, marginally over the free tier; it cannot be sustained in practice,
+but that is the number to keep in mind before shortening any interval.
+
+### Codex
+
+`codex-cli 0.152.1` **has now actually run** in this project (threads
+`01a07b84-afcd-76f1-ae1a-f3e59eda7225` for the refactor,
+`01a07b85-139b-7ee2-8525-c246c44d0a71` for the review), correcting §4's note.
+Two things to know:
+
+- The `codex-subagent:codex-delegate` agent type is provisioned **without a
+  shell tool**, so it silently cannot invoke the CLI and falls back to its own
+  knowledge. Dispatch via a `general-purpose` agent instead.
+- Passing `--task "@file"` to the wrapper from PowerShell breaks: the MSYS
+  runtime expands `@path` as a response file and splats the prompt across argv.
+  Wrap the call in `bash -lc '<full command>'` with POSIX paths.
+
+Codex's review produced one confident false positive (claiming
+`uploadsPollSeconds` was undefined when it is in `config.js`), so verify its
+line-number claims against the file — the reasoning was sound, the coordinates
+drifted.

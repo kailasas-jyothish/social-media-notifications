@@ -1,19 +1,10 @@
 import { XMLParser } from 'fast-xml-parser';
-import { getText } from '../http.js';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
   removeNSPrefix: true,
 });
-
-/**
- * The URL that actually serves the Atom document. Note this is NOT the legacy
- * `/xml/feeds/videos.xml` path — that one now returns a static placeholder
- * with zero entries. Verified against the live feed.
- */
-export const feedUrl = (channelId) =>
-  `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
 
 /**
  * Topics to register with the hub. Google's hub has historically keyed on the
@@ -27,8 +18,7 @@ export const topicUrls = (channelId) => [
 ];
 
 /**
- * Parse a YouTube Atom feed body (the same shape arrives via WebSub push and
- * via a plain GET of the RSS feed). Returns { entries, deleted }.
+ * Parse the YouTube Atom body delivered by WebSub push.
  */
 export function parseAtom(xml) {
   const doc = parser.parse(xml);
@@ -55,9 +45,4 @@ export function parseAtom(xml) {
   );
 
   return { entries, deleted };
-}
-
-export async function fetchFeed(channelId) {
-  const xml = await getText(feedUrl(channelId), { retries: 1 });
-  return parseAtom(xml);
 }

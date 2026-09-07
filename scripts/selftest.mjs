@@ -3,21 +3,16 @@
  * Offline sanity check — no deploy needed.
  *   node --env-file=.env scripts/selftest.mjs
  *
- * Verifies: channel resolution, Atom feed parsing, Shorts detection, the
- * cookie-free /live probe, YouTube API key validity, Slack credentials, and
- * (if configured) the Facebook Page token.
+ * Verifies: YouTube API discovery and classification, Shorts detection, Slack
+ * credentials, and (if configured) the Facebook Page token.
  */
 import { config } from '../src/config.js';
 import {
   resolveChannelId,
-  hasApiKey,
   videosList,
   isShort,
-  probeChannelLive,
   recentUploads,
 } from '../src/youtube/api.js';
-import { setOwner, verify, ownerHandle } from '../src/youtube/owner.js';
-import { fetchFeed } from '../src/youtube/feed.js';
 import { postPlain } from '../src/slack.js';
 import { graph } from '../src/facebook/graph.js';
 
@@ -39,46 +34,30 @@ await check('resolve YouTube channel', async () => {
   return `${config.youtube.channel} -> ${channelId}`;
 });
 
-await check('fetch + parse Atom feed', async () => {
-  const { entries } = await fetchFeed(channelId);
-  latest = entries[0];
-  return `${entries.length} entries, newest: ${latest?.videoId} "${latest?.title}"`;
+await check('recent uploads via API', async () => {
+  const items = await recentUploads(channelId);
+  const foreign = items.filter((item) => item.channelId !== channelId);
+  if (foreign.length) {
+    throw new Error(
+      `${foreign.length} item(s) are not from ${channelId}: ` +
+        foreign.map((item) => `${item.videoId}:${item.channelId || 'missing'}`).join(', '),
+    );
+  }
+  latest = items[0];
+  if (!latest) throw new Error('playlistItems.list returned no uploads');
+  return `${items.length} uploads, newest: ${latest.videoId} "${latest.title}"`;
 });
 
-// The primary path on the server: youtube.com's feed 404s from that IP.
-await check('recent uploads via API', async () => {
-  if (!hasApiKey()) return 'skipped (YOUTUBE_API_KEY unset — RSS is the only route)';
-  const items = await recentUploads(channelId);
-  const foreign = items.filter((e) => e.channelId !== channelId);
-  if (foreign.length) throw new Error(`${foreign.length} items are not from this channel`);
-  return `${items.length} uploads, newest: ${items[0]?.videoId} "${items[0]?.title}"`;
+await check('YouTube Data API key', async () => {
+  const items = await videosList([latest.videoId]);
+  const it = items[0];
+  return it ? `videos.list ok: liveBroadcastContent=${it.snippet.liveBroadcastContent}, duration=${it.contentDetails?.duration}` : 'no items returned';
 });
 
 await check('Shorts redirect probe', async () => {
   const short = await isShort(latest.videoId);
+  if (short === null) return `${latest.videoId}: inconclusive`;
   return `${latest.videoId} is ${short ? 'a Short' : 'not a Short'}`;
-});
-
-await check('channel /live probe (no API key needed)', async () => {
-  const live = await probeChannelLive(channelId);
-  return live ? `LIVE NOW: ${live.videoId} "${live.title}" (via ${live.via})` : 'not currently live';
-});
-
-// The gate that stops the /live probe's recommendation rail reaching Slack.
-await check('ownership gate', async () => {
-  await setOwner(channelId);
-  const mine = await verify(latest.videoId);
-  const theirs = await verify('H0_-an5hio8'); // a Sadhguru video the old probe posted
-  if (!mine.own) throw new Error(`own video ${latest.videoId} was rejected`);
-  if (theirs.own) throw new Error('a foreign video was accepted');
-  return `handle=${ownerHandle() || 'none'}; accepts own, rejects "${theirs.author || 'unknown'}"`;
-});
-
-await check('YouTube Data API key', async () => {
-  if (!hasApiKey()) return 'skipped (YOUTUBE_API_KEY unset — live detection falls back to the free probe)';
-  const items = await videosList([latest.videoId]);
-  const it = items[0];
-  return it ? `videos.list ok: liveBroadcastContent=${it.snippet.liveBroadcastContent}, duration=${it.contentDetails?.duration}` : 'no items returned';
 });
 
 await check('Slack credentials', async () => {
